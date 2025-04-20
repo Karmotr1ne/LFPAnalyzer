@@ -1,5 +1,7 @@
-import sys,glob
-import os,neo
+import sys
+import glob
+import os
+import neo
 from neo.io import NixIO
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import QSettings, QDir, Qt
@@ -110,6 +112,16 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
 # Methods
 
+    #unique name
+    def _generate_unique_name(self, base_name):
+        """Return a unique name not already in self.signals."""
+        name = base_name
+        counter = 1
+        while name in self.signals:
+            name = f"{base_name}_v{counter}"
+            counter += 1
+        return name
+
     #load path
     def load_single_abf(self, path):
         """Helper to load one ABF file at path and update UI."""
@@ -124,16 +136,12 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             return
         # unique name
         base_name = os.path.basename(path)
-        display_name = base_name
-        counter = 1
-        while display_name in self.signals:
-            display_name = f"{base_name}_v{counter}"
-            counter += 1
+        display_name = self._generate_unique_name(base_name)
         # store
-        self.signals[path] = signal
+        self.signals[display_name] = signal
         # add to tree, save path to UserRole
-        item = QtWidgets.QTreeWidgetItem([os.path.basename(path)])
-        item.setData(0, QtCore.Qt.UserRole, path)
+        item = QtWidgets.QTreeWidgetItem([display_name])
+        item.setData(0, QtCore.Qt.UserRole, display_name)
         self.file_tree.addTopLevelItem(item)
         # if first loaded or no current, set as current
         if self.current_file is None:
@@ -214,13 +222,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         # show top
         top_item = selected[0]
-        path = top_item.data(0, QtCore.Qt.UserRole)
-        if path not in self.signals:
+        display_name = top_item.data(0, QtCore.Qt.UserRole)
+        if display_name not in self.signals:
             return
 
         # refresh
-        self.current_file = path
-        self.raw_signal = self.signals[path]
+        self.current_file = display_name
+        self.raw_signal = self.signals[display_name]
         self.proc_signal = None
 
         # redraw raw_plot
@@ -266,21 +274,12 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Error", f"Downsampling failed:\n{e}")
             return
 
-        #cache data
-        basename = os.path.basename(self.current_file)
-        new_key = f"{basename}_down{factor}x"
-        self.signals[new_key] = dsig
-        self.proc_signal = dsig
-
-        # unique display_name
+        # generate and apply unique display_name
         factor = self.spin_down.value()
         base = os.path.basename(self.current_file)
         base_wo_ext = os.path.splitext(base)[0]
-        display_name = f"{base_wo_ext}_down{factor}x"
-        counter = 1
-        while display_name in self.signals:
-            display_name = f"{base_wo_ext}_down{factor}x_v{counter}"
-            counter += 1
+        base_display_name = f"{base_wo_ext}_down{factor}x"
+        display_name = self._generate_unique_name(base_display_name)
 
         #add to tree and selected
         self.signals[display_name] = dsig
@@ -312,7 +311,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         if not out_dir:
             return
 
-        from neo.io import NixIO
         errors = []
 
         for item in selected_items:
