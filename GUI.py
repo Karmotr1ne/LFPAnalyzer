@@ -13,6 +13,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.setWindowTitle('LFP Data Analyzer')
         self.resize(1200, 800)
         self.signals = {}
+        self.loaded_paths = set()
         self.current_file = None
         self.raw_signal = None
         self.proc_signal = None
@@ -143,9 +144,10 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         item = QtWidgets.QTreeWidgetItem([display_name])
         item.setData(0, QtCore.Qt.UserRole, display_name)
         self.file_tree.addTopLevelItem(item)
+        self.loaded_paths.add(path)
         # if first loaded or no current, set as current
         if self.current_file is None:
-            self.current_file = path
+            self.current_file = display_name
             self.raw_signal = signal
             # plot raw
             self.raw_plot.clear()
@@ -173,7 +175,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 return
 
             # get new files
-            new_abfs = [f for f in all_abfs if f not in self.signals]
+            new_abfs = [f for f in all_abfs if f not in self.loaded_paths]
 
             if not new_abfs:
                 # reload?
@@ -188,6 +190,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 # Reload: clear old trace
                 self.file_tree.clear()
                 self.signals.clear()
+                self.loaded_paths.clear()
                 self.current_file = None
                 self.raw_signal = None
                 self.proc_signal = None
@@ -266,8 +269,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         if self.raw_signal is None:
             QtWidgets.QMessageBox.warning(self, "Warning", "No raw signal to downsample.")
             return
-
-        factor = self.spin_down.value()
         try:
             dsig = self.raw_signal[::factor]
         except Exception as e:
