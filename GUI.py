@@ -4,7 +4,7 @@ import neo
 import numpy as np
 import pyqtgraph as pg
 from neo.io import NixIO
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets,QtCore
 from PyQt5.QtCore import QSettings, QDir, Qt
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
@@ -20,12 +20,14 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.current_key = None
         self.raw_signal = None
         self.proc_signal = None
+        self.baseline_curve = []
         self._create_main_layout()
 
         #Memory location and Load more data
         self.settings = QSettings('FileLocation', 'LFPAnalyzer')        
         self.file_tree.itemClicked.connect(self.on_tree_item_clicked)
 
+    #GUI
     def _create_main_layout(self):
         # Central widget and main splitter
         central = QtWidgets.QWidget()
@@ -81,20 +83,43 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.base_p = 1e-4      # p
 
         als_layout = QtWidgets.QHBoxLayout()
-        als_layout.addWidget(QtWidgets.QLabel('λ (10^σ):'))
+        als_layout.addWidget(QtWidgets.QLabel('λ (10^x):'))
 
         self.spin_sigma_lambda = QtWidgets.QSpinBox()
-        self.spin_sigma_lambda.setRange(-3, 5)  # range
+        self.spin_sigma_lambda.setRange(-3, 5)
         self.spin_sigma_lambda.setValue(0)
         als_layout.addWidget(self.spin_sigma_lambda)
 
-        als_layout.addWidget(QtWidgets.QLabel('p (10^σ):'))
+        als_layout.addWidget(QtWidgets.QLabel('p (10^x):'))
         self.spin_sigma_p = QtWidgets.QSpinBox()
         self.spin_sigma_p.setRange(-3, 3)
         self.spin_sigma_p.setValue(0)
         als_layout.addWidget(self.spin_sigma_p)
 
         left_layout.addLayout(als_layout)
+
+        # Reduce baseline UI (with checkbox and method combo)
+        self.chk_use_time = QtWidgets.QCheckBox("Select baseline range")
+        self.chk_use_time.setChecked(False)
+        self.chk_use_time.stateChanged.connect(self.toggle_time_selector)
+
+        self.combo_baseline_mode = QtWidgets.QComboBox()
+        self.combo_baseline_mode.addItems(['mode', 'mean', 'median'])
+
+        # def layout
+        baseline_layout = QtWidgets.QHBoxLayout()
+
+        self.chk_use_time = QtWidgets.QCheckBox("Select baseline range")
+        self.chk_use_time.setChecked(False)
+        self.chk_use_time.stateChanged.connect(self.toggle_time_selector)
+        baseline_layout.addWidget(self.chk_use_time)
+
+        self.combo_baseline_mode = QtWidgets.QComboBox()
+        self.combo_baseline_mode.addItems(['mode', 'mean', 'median'])
+        baseline_layout.addWidget(QtWidgets.QLabel("Method:"))
+        baseline_layout.addWidget(self.combo_baseline_mode)
+
+        left_layout.addLayout(baseline_layout) 
 
         # Batch processing button
         self.btn_batch = QtWidgets.QPushButton('Batch Process')
@@ -108,22 +133,41 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         # Right panel: Plots and controls
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
+        self._drag_start = None
 
         # Raw signal plot
         self.raw_plot = pg.PlotWidget(title='Raw Signal')
         self.raw_plot.setBackground('w')  
+        self.raw_plot.mousePressEvent = lambda e: self.start_time_select(e, self.raw_plot)
+        self.raw_plot.mouseReleaseEvent = lambda e: self.end_time_select(e, self.raw_plot)
         right_layout.addWidget(self.raw_plot)
 
         # Processed signal plot
         self.proc_plot = pg.PlotWidget(title='Processed Signal')
-        self.proc_plot.setBackground('w')  
+        self.proc_plot.setBackground('w') 
+        #sync
+        self.proc_selector_fill = pg.LinearRegionItem([0, 0], brush=(0, 100, 255, 50))
+        self.proc_selector_fill.setZValue(10)
+        self.proc_selector_fill.setMovable(False)
+        self.proc_selector_fill.setVisible(False)
+        self.proc_plot.addItem(self.proc_selector_fill)
+        #mouse selection
+        self.proc_plot.mousePressEvent = lambda e: self.start_time_select(e, self.proc_plot)
+        self.proc_plot.mouseReleaseEvent = lambda e: self.end_time_select(e, self.proc_plot) 
         right_layout.addWidget(self.proc_plot)
+
+        #draw selected area
+        self.raw_plot.scene().sigMouseMoved.connect(self.on_mouse_drag_move)
+        self.proc_plot.scene().sigMouseMoved.connect(self.on_mouse_drag_move)
+
 
         # Operation buttons below processed plot
         op_layout = QtWidgets.QHBoxLayout()
         self.btn_smooth = QtWidgets.QPushButton('ALS Detrend')
+        self.btn_align = QtWidgets.QPushButton("Zero Baseline")
         self.btn_detect = QtWidgets.QPushButton('Spike Detect')
         op_layout.addWidget(self.btn_smooth)
+        op_layout.addWidget(self.btn_align)
         op_layout.addWidget(self.btn_detect)
 
         right_layout.addLayout(op_layout)
@@ -136,6 +180,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.btn_apply.clicked.connect(self.apply_downsample)
         self.btn_batch.clicked.connect(self.batch_process)
         self.btn_smooth.clicked.connect(self.apply_smooth)
+        self.btn_align.clicked.connect(self.apply_zero_baseline)
         self.btn_detect.clicked.connect(self.apply_detect)
 
 # Methods
@@ -179,7 +224,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         if self.current_key is None:
             self.current_key = display_name
             self.raw_signal = signal
-            self.raw_plot.clear()
+            self.clear_raw_plot()
             self._plot_signal(signal, self.raw_plot, color='b')
 
     #load method
@@ -280,21 +325,26 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.raw_signal = None
         self.proc_signal = None
         self.current_key = None
-
+       
     #plot signal
-    def _plot_signal(self, signal, plot_widget, color='b', width=1, name=None):
-        """
-        Plot a signal on the given plot_widget with optional color, width and legend name.
-        """
-        if signal is None:
-            return
+    def _plot_signal(self, signal, plot, color='b', width=1, name=None, return_item=False):
+
         t = signal.times.rescale('s').magnitude.flatten()
         y = signal.magnitude.flatten()
+
         pen = pg.mkPen(color=color, width=width)
-        if name:
-            plot_widget.plot(t, y, pen=pen, name=name)
-        else:
-            plot_widget.plot(t, y, pen=pen)
+
+        # plot
+        plot.plot(t, y, pen=pen, name=name)
+
+        if return_item:
+            return plot.listDataItems()[-1]
+
+        # add proc_selector_fill to proc_plot
+        if plot == self.proc_plot:
+            if hasattr(self, "proc_selector_fill") and self.proc_selector_fill is not None:
+                if self.proc_selector_fill not in self.proc_plot.items():
+                    self.proc_plot.addItem(self.proc_selector_fill, ignoreBounds=True)
 
     #unique name
     def _generate_unique_name(self, base_name):
@@ -308,29 +358,25 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
     #file tree
     def on_tree_item_clicked(self, *_):
-        """Enable selection of multiple signals, draw top selected."""
+
         selected = self.file_tree.selectedItems()
         if not selected:
             return
 
-        # show top
         top_item = selected[0]
         display_name = top_item.data(0, QtCore.Qt.UserRole)
         if display_name not in self.signals:
             return
 
-        # refresh
         self.current_key = display_name
         self.raw_signal = self.signals[display_name]
         self.proc_signal = None
 
-        # redraw raw_plot
-        self.raw_plot.clear()
+        self.clear_raw_plot()
         self._plot_signal(self.raw_signal, self.raw_plot, color='b')
+        self.clear_proc_plot()
 
-        # clear processe_plot
-        self.proc_plot.clear()
-    
+    #tree right click open menu
     #menu
     def open_context_menu(self, position):
         menu = QtWidgets.QMenu()
@@ -344,7 +390,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.clear_and_reload()
         elif action == overlay_action:
             self.overlay_selected_signals()
-    #right click open menu
+   
     #clear&reload
     def clear_and_reload(self):
         self.file_tree.clear()
@@ -353,61 +399,77 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.current_key = None
         self.raw_signal = None
         self.proc_signal = None
+        self.baseline_curve = []
         self.raw_plot.clear()
         self.proc_plot.clear()
+    def clear_plot_with_selector(self, plot_name, selector_name):
+        """clear selected plot and keep utensils"""
+        plot = getattr(self, plot_name, None)
+        selector = getattr(self, selector_name, None)
+
+        if plot is not None:
+            plot.clear()
+            if selector is not None and selector not in plot.items():
+                plot.addItem(selector)
+    def clear_raw_plot(self):
+        self.clear_plot_with_selector('raw_plot', 'time_selector')
+    def clear_proc_plot(self):
+        self.clear_plot_with_selector('proc_plot', 'proc_selector_fill')
+    
     #overlay
     def overlay_selected_signals(self):
+        if self.baseline_curve is not None:
+            self.raw_plot.removeItem(self.baseline_curve)
+            self.baseline_curve = []
         selected_items = self.file_tree.selectedItems()
         if not selected_items:
             QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected.")
             return
 
         self.raw_plot.clear()
-
         legend = self.raw_plot.addLegend(offset=(10, 10))
         colors = ['b', 'r', 'm', 'c', 'y', 'k']
         color_cycle = iter(colors * 10)
 
-        self.overlay_curves = {}  # save legend -> plot item
+        self.overlay_curves = {}
 
         for item in selected_items:
             key = item.data(0, QtCore.Qt.UserRole)
             if key not in self.signals:
                 continue
             signal = self.signals[key]
-            color = next(color_cycle)
             t = signal.times.rescale('s').magnitude.flatten()
             y = signal.magnitude.flatten()
-            pen = pg.mkPen(color=color, width=1)
-            plot_item = self.raw_plot.plot(t, y, pen=pen, name=key)
+            pen = pg.mkPen(color=next(color_cycle), width=1)
+            curve = self.raw_plot.plot(t, y, pen=pen, name=key)
+            self.overlay_curves[key] = curve
 
-            # save key to plot item
-            self.overlay_curves[key] = plot_item
-
-        # set last as signal
+        # last = current key
         last_key = selected_items[-1].data(0, QtCore.Qt.UserRole)
         if last_key in self.signals:
             self.current_key = last_key
             self.raw_signal = self.signals[last_key]
             self.proc_signal = None
 
-        # click legend hide/show
+        # legend toggle
         for sample in legend.items:
-            label = sample[1]
-            key = label.text
+            _, label = sample  # (itemSample, labelItem)
+            text = label.text
 
-            # keep key leagel
-            if key not in self.overlay_curves:
+            if text not in self.overlay_curves:
                 continue
 
-            curve = self.overlay_curves[key]
+            curve = self.overlay_curves[text]
 
-            def toggle(curve=curve):
-                curve.setVisible(not curve.isVisible())
+            def make_toggle_handler(curve_ref=curve, label_ref=label):
+                def toggle(event):
+                    vis = not curve_ref.isVisible()
+                    curve_ref.setVisible(vis)
+                return toggle
 
-            # connect to click event
-            label.mousePressEvent = lambda ev, curve=curve: toggle(curve)
-            
+            label.mousePressEvent = make_toggle_handler()
+
+    #Utility         
     #size reduce
     def apply_downsample(self):
         if self.raw_signal is None:
@@ -446,62 +508,273 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         # plot
         self.proc_plot.clear()
         self._plot_signal(new_signal, self.proc_plot, color='r')
-
-    def batch_process(self):
-        """Execute pipeline on all files in tree."""
-        pass
-
+    
     #smooth
     def apply_smooth(self):
-        if self.raw_signal is None:
-            QtWidgets.QMessageBox.warning(self, "Warning", "No raw signal to smooth.")
+        for curve in self.baseline_curve:
+            self.raw_plot.removeItem(curve)
+        self.baseline_curve.clear()
+        selected_items = self.file_tree.selectedItems()
+        if not selected_items:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected.")
             return
 
-        try:
-            from neo.core import AnalogSignal
-            import quantities as pq
+        from neo.core import AnalogSignal
+        import quantities as pq
 
-            y = self.raw_signal.magnitude.flatten()
+        # clear process
+        self.clear_proc_plot()
 
-            #cal lam and p
-            sigma_lambda = self.spin_sigma_lambda.value()
-            sigma_p = self.spin_sigma_p.value()
+        # clear old baseline
+        if self.baseline_curve:
+            self.raw_plot.removeItem(self.baseline_curve)
+            self.baseline_curve = []
 
-            lam = self.base_lambda * (10 ** sigma_lambda)
-            p = self.base_p * (10 ** sigma_p)
+        # get ALS parameters
+        sigma_lambda = self.spin_sigma_lambda.value()
+        sigma_p = self.spin_sigma_p.value()
+        lam = self.base_lambda * (10 ** sigma_lambda)
+        p = self.base_p * (10 ** sigma_p)
 
-            #als using lam and p
-            baseline = als_baseline(y, lam=lam, p=p)
-            detrended = y - baseline
+        self.baseline_curve = []  # multiple baseline
 
-            smoothed_signal = AnalogSignal(
-                detrended.reshape(-1, 1),
-                units=self.raw_signal.units,
-                sampling_rate=self.raw_signal.sampling_rate,
-                t_start=self.raw_signal.t_start,
-                name=f"{self.raw_signal.name}_als" if self.raw_signal.name else None
+        for item in selected_items:
+            key = item.data(0, QtCore.Qt.UserRole)
+            if key not in self.signals:
+                continue
+
+            raw_signal = self.signals[key]
+            y = raw_signal.magnitude.flatten()
+
+            try:
+                baseline = als_baseline(y, lam=lam, p=p)
+                detrended = y - baseline
+
+                # detect baseline
+                method = self.combo_baseline_mode.currentText()
+
+                # extract based on time selector (or fallback to detrended)
+                sample_values = self.extract_data_from_time_range()
+                if sample_values is None or len(sample_values) == 0:
+                    sample_values = detrended
+
+                # remove baseline
+                baseline_val = extract_baseline_value(sample_values, method=method)
+                detrended = detrended - baseline_val
+
+                # new AnalogSignal
+                smoothed_signal = AnalogSignal(
+                    detrended.reshape(-1, 1),
+                    units=raw_signal.units,
+                    sampling_rate=raw_signal.sampling_rate,
+                    t_start=raw_signal.t_start,
+                    name=f"{raw_signal.name}_als" if raw_signal.name else None
+                )
+
+                # baseline as signal
+                baseline_signal = AnalogSignal(
+                    baseline.reshape(-1, 1),
+                    units=raw_signal.units,
+                    sampling_rate=raw_signal.sampling_rate,
+                    t_start=raw_signal.t_start,
+                    name=f"{raw_signal.name}_baseline" if raw_signal.name else None
+                )
+
+                # add to tree
+                display_name = self._generate_unique_name(f"{key}_als")
+                self.signals[display_name] = smoothed_signal
+                new_item = QtWidgets.QTreeWidgetItem([display_name])
+                new_item.setData(0, QtCore.Qt.UserRole, display_name)
+                self.file_tree.addTopLevelItem(new_item)
+
+                # show and keep raw_plot
+                self.current_key = display_name
+                self.proc_signal = smoothed_signal
+                self.file_tree.setCurrentItem(new_item)
+
+                self.clear_proc_plot()
+                self._plot_signal(smoothed_signal, self.proc_plot, color='g', width=1, name=display_name)
+
+                curve = self._plot_signal(baseline_signal, self.raw_plot, color='orange', width=2, name='Baseline', return_item=True)
+
+                self.baseline_curve.append(curve)
+
+
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "ALS Error", f"{key} failed:\n{e}")
+                continue
+    
+    #remove baseline
+    def apply_zero_baseline(self):
+        from neo.core import AnalogSignal
+
+        if self.current_key is None or self.current_key not in self.signals:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No signal selected.")
+            return
+
+        if "als" not in self.current_key:
+            QtWidgets.QMessageBox.warning(self, "Invalid Source", "Please select an ALS-processed signal (name contains 'als').")
+            return
+
+        signal = self.signals[self.current_key]
+        y = signal.magnitude.flatten()
+        method = self.combo_baseline_mode.currentText()
+
+        sample_values = self.extract_data_from_time_range()
+        if sample_values is None or len(sample_values) == 0:
+            sample_values = y
+
+        baseline_val = extract_baseline_value(sample_values, method=method)
+        centered = y - baseline_val
+        centered = np.clip(centered, 0, None)
+
+        aligned_signal = AnalogSignal(
+            centered.reshape(-1, 1),
+            units=signal.units,
+            sampling_rate=signal.sampling_rate,
+            t_start=signal.t_start,
+            name=f"{signal.name}_zeroed" if signal.name else None
+        )
+
+        display_name = self._generate_unique_name(f"{self.current_key}_zeroed")
+        self.signals[display_name] = aligned_signal
+        self.proc_signal = aligned_signal
+
+        new_item = QtWidgets.QTreeWidgetItem([display_name])
+        new_item.setData(0, QtCore.Qt.UserRole, display_name)
+        self.file_tree.addTopLevelItem(new_item)
+        self.file_tree.setCurrentItem(new_item)
+
+        self.current_key = display_name
+
+        self.clear_proc_plot()
+        self._plot_signal(aligned_signal, self.proc_plot, color='m', width=1, name=display_name)
+
+    #baseline time selector
+    def toggle_time_selector(self, state):
+        use_time = state == Qt.Checked
+
+        if hasattr(self, "time_selector") and self.time_selector is not None:
+            self.time_selector.setVisible(use_time)
+
+        if hasattr(self, "proc_selector_fill") and self.proc_selector_fill is not None:
+            self.proc_selector_fill.setVisible(use_time)
+
+        if self.raw_plot.plotItem.legend is not None:
+            self.raw_plot.plotItem.legend.setVisible(not use_time)
+        if self.proc_plot.plotItem.legend is not None:
+            self.proc_plot.plotItem.legend.setVisible(not use_time)
+
+    def extract_data_from_time_range(self):
+        if self.current_key is None or "als" not in self.current_key:
+            return None
+
+        signal = self.signals[self.current_key]
+        t = signal.times.rescale('s').magnitude.flatten()
+        y = signal.magnitude.flatten()
+
+        # from showing range
+        if hasattr(self, "time_selector") and self.time_selector is not None:
+            x0, x1 = self.time_selector.getRegion()
+        else:
+            x0, x1 = self.raw_plot.viewRange()[0]
+
+        mask = (t >= x0) & (t <= x1)
+        return y[mask] if np.any(mask) else y
+
+    #mouse event
+    def start_time_select(self, event, plot):
+        if event.button() != Qt.LeftButton:
+            return
+
+        mouse_point = plot.plotItem.vb.mapToView(event.pos())
+        self._drag_start = mouse_point.x()
+
+        region = [self._drag_start, self._drag_start + 0.01]
+
+        if not hasattr(self, "time_selector") or self.time_selector is None:
+            self.time_selector = pg.LinearRegionItem(
+                region, brush=(0, 100, 255, 100)
             )
+            self.time_selector.setMovable(False)
+            self.time_selector.setZValue(10)
+            self.raw_plot.addItem(self.time_selector)
+        else:
+            self.time_selector.setRegion(region)
 
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", f"ALS failed:\n{e}")
+        self.time_selector.setVisible(True)
+
+        # sync proc_plot
+        if hasattr(self, "proc_selector_fill"):
+            self.proc_selector_fill.setRegion(region)
+            self.proc_selector_fill.setVisible(True)
+    
+    def end_time_select(self, event, plot):
+        if event.button() != Qt.LeftButton or self._drag_start is None:
             return
 
-        # insert signal dict and tree
-        base_name = f"{self.current_key}_als"
-        display_name = self._generate_unique_name(base_name)
-        self.signals[display_name] = smoothed_signal
-        self.proc_signal = smoothed_signal
+        mouse_point = plot.plotItem.vb.mapToView(event.pos())
+        x0 = self._drag_start
+        x1 = mouse_point.x()
 
-        item = QtWidgets.QTreeWidgetItem([display_name])
-        item.setData(0, QtCore.Qt.UserRole, display_name)
-        self.file_tree.addTopLevelItem(item)
-        self.file_tree.setCurrentItem(item)
+        if abs(x1 - x0) < 1e-3:
+            x1 = x0 + 0.01
 
-        self.proc_plot.clear()
-        self._plot_signal(smoothed_signal, self.proc_plot, color='g')
+        region = [min(x0, x1), max(x0, x1)]
+
+        if not hasattr(self, "time_selector") or self.time_selector is None:
+            self.time_selector = pg.LinearRegionItem(
+                region, brush=(0, 100, 255, 100)
+            )
+            self.time_selector.setMovable(False)
+            self.time_selector.setZValue(10)
+            self.time_selector.setPen(pg.mkPen(color='b', width=2))
+            self.raw_plot.addItem(self.time_selector)
+        else:
+            self.time_selector.setRegion(region)
+
+        self._drag_start = None
+        self.sync_xrange(plot)
+
+        # sync proc_plot
+        if hasattr(self, "proc_selector_fill"):
+            self.proc_selector_fill.setRegion(region)
+            self.proc_selector_fill.setVisible(True)
+
+    def on_mouse_drag_move(self, pos):
+        if self._drag_start is None:
+            return
+
+        for plot in [self.raw_plot, self.proc_plot]:
+            vb = plot.plotItem.vb
+            if vb.sceneBoundingRect().contains(pos):
+                mouse_point = vb.mapToView(pos)
+                x = mouse_point.x()
+                x0 = self._drag_start
+                x1 = x
+                region = [min(x0, x1), max(x0, x1)]
+
+                if hasattr(self, "time_selector") and self.time_selector is not None:
+                    self.time_selector.setRegion(region)
+
+                # sync proc_plot
+                if hasattr(self, "proc_selector_fill"):
+                    self.proc_selector_fill.setRegion(region)
+                    self.proc_selector_fill.setVisible(True)
+                break
+
+    def sync_xrange(self, source_plot):
+        """sync x axis"""
+        x_min, x_max = source_plot.viewRange()[0]
+        target_plot = self.proc_plot if source_plot == self.raw_plot else self.raw_plot
+        target_plot.setXRange(x_min, x_max, padding=0)
 
     def apply_detect(self):
         """Detect spikes on processed signal."""
+        pass
+
+    def batch_process(self):
+        """Execute pipeline on all files in tree."""
         pass
 
 # ALS
@@ -524,7 +797,24 @@ def als_baseline(y, lam=1e4, p=1e-4, niter=10):
         w = p * (y > z) + (1 - p) * (y < z)
 
     return z
-  
+
+#get baseline height
+def extract_baseline_value(y, method='mode', sample_size=10000):
+    """get baseline value from signal"""
+    y = y.flatten()
+    sample = y[:sample_size] if len(y) > sample_size else y
+
+    if method == 'mean':
+        return np.mean(sample)
+    elif method == 'median':
+        return np.median(sample)
+    elif method == 'mode':
+        hist, bin_edges = np.histogram(sample, bins=100)
+        max_bin = np.argmax(hist)
+        return (bin_edges[max_bin] + bin_edges[max_bin + 1]) / 2
+    else:
+        raise ValueError("Invalid method")
+
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
     win = LFPAnalyzer()
