@@ -24,6 +24,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self._create_main_layout()
         self.raw_plot.addLegend()
         self.raw_plot.plotItem.legend.setVisible(False)
+        self.combo_wavelet.setCurrentText('cmor')
 
 
         #Memory location and Load more data
@@ -116,6 +117,16 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         left_layout.addLayout(baseline_layout) 
 
+        # Wavelet mother selection
+        wavelet_layout = QtWidgets.QHBoxLayout()
+        wavelet_layout.addWidget(QtWidgets.QLabel("Mother wavelet:"))
+
+        self.combo_wavelet = QtWidgets.QComboBox()
+        self.combo_wavelet.addItems(['morl', 'cmor', 'mexh', 'gaus1'])
+        wavelet_layout.addWidget(self.combo_wavelet)
+
+        left_layout.addLayout(wavelet_layout)
+
         # clustering
         self.mergeSpikesCheckBox = QtWidgets.QCheckBox("Merge nearby spikes")
         self.mergeSpikesCheckBox.setChecked(True)
@@ -124,7 +135,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.minIntervalSpinBox = QtWidgets.QDoubleSpinBox()
         self.minIntervalSpinBox.setRange(1.0, 1000.0)
         self.minIntervalSpinBox.setSingleStep(1.0)
-        self.minIntervalSpinBox.setValue(30.0)
+        self.minIntervalSpinBox.setValue(200.0)
 
         clusterLayout = QtWidgets.QHBoxLayout()
         clusterLayout.addWidget(self.mergeSpikesCheckBox)
@@ -196,7 +207,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.btn_detect.clicked.connect(self.apply_detect)
 
 # Methods
-
     #load file
     def load_single_file(self, path):
         """Load a single ABF or HDF5 file into the UI and signal dict."""
@@ -213,31 +223,33 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 return
 
             block = reader.read_block(lazy=False)
-            signal = block.segments[0].analogsignals[0]
+            base_name = os.path.splitext(os.path.basename(path))[0]
+
+            for i, seg in enumerate(block.segments):
+                if not seg.analogsignals:
+                    continue  # avoid blank segment
+                signal = seg.analogsignals[0]
+
+                display_name = self._generate_unique_name(f"{base_name}_sweep{i+1}")
+                self.signals[display_name] = signal
+                self.path_map[display_name] = path
+                self.loaded_paths.add(path)
+
+                item = QtWidgets.QTreeWidgetItem([display_name])
+                item.setData(0, QtCore.Qt.UserRole, display_name)
+                self.file_tree.addTopLevelItem(item)
+
+                # first as current key
+                if self.current_key is None:
+                    self.current_key = display_name
+                    self.raw_signal = signal
+                    self.clear_raw_plot()
+                    self._plot_signal(signal, self.raw_plot, color='b')
 
         except Exception as e:
             QtWidgets.QMessageBox.critical(
                 self, "Error", f"Failed to load:\n{os.path.basename(path)}\n\n{e}")
-            return
-
-        #load name
-        base_name = os.path.splitext(os.path.basename(path))[0]
-        display_name = self._generate_unique_name(base_name)
-
-        self.signals[display_name] = signal
-        self.path_map[display_name] = path
-        self.loaded_paths.add(path)
-
-        item = QtWidgets.QTreeWidgetItem([display_name])
-        item.setData(0, QtCore.Qt.UserRole, display_name)
-        self.file_tree.addTopLevelItem(item)
-
-        # If first file, set as current and plot
-        if self.current_key is None:
-            self.current_key = display_name
-            self.raw_signal = signal
-            self.clear_raw_plot()
-            self._plot_signal(signal, self.raw_plot, color='b')
+    
 
     #load method
     def load_file(self):
@@ -354,7 +366,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
     #plot signal
     def _plot_signal(self, signal, plot, color='b', width=1, name=None, return_item=False):
 
-        t = signal.times.rescale('s').magnitude.flatten()
+        t = (signal.times - signal.t_start).rescale('s').magnitude.flatten()
         y = signal.magnitude.flatten()
 
         pen = pg.mkPen(color=color, width=width)
@@ -762,12 +774,11 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         y = signal.magnitude.flatten()
         fs = float(signal.sampling_rate.rescale('Hz').magnitude)
 
-        # detect
-        spike_idx = wavelet_spike_detect(y, fs)
-        spike_times = spike_idx / fs
+        wavelet_name = self.combo_wavelet.currentText()
+        spike_idx = wavelet_spike_detect(y, fs, wavelet_name=wavelet_name)
         spike_amps = y[spike_idx]
+        spike_times = self.get_relative_time(signal, spike_idx, mode='index')
 
-        # cluster
         if self.mergeSpikesCheckBox.isChecked():
             min_interval = self.minIntervalSpinBox.value() / 1000.0
             spike_times, spike_amps = cluster_spikes(spike_times, spike_amps, min_interval=min_interval)
@@ -777,7 +788,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         self.plot_detected_spikes()
 
-
     def plot_detected_spikes(self):
         key = self.current_key
         if key is None or key not in self.signals:
@@ -786,13 +796,24 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.clear_proc_plot()
 
         signal = self.signals[key]
-        t = signal.times.rescale('s').magnitude.flatten()
+        # subtract t_start
+        t = self.get_relative_time(signal, signal.times.rescale('s').magnitude, mode='time')
         y = signal.magnitude.flatten()
 
         self.proc_plot.plot(t, y, pen=pg.mkPen('b'))
         self.proc_plot.plot(self.spike_times, self.spike_amps, pen=None,
                             symbol='o', symbolBrush='r', symbolSize=6, name="Spikes")
 
+    def get_relative_time(self, signal, indices_or_times, mode='index'):
+        """Convert index or time array into relative time"""
+        if mode == 'index':
+            fs = float(signal.sampling_rate.rescale('Hz'))
+            return np.array(indices_or_times) / fs
+        elif mode == 'time':
+            t0 = float(signal.t_start.rescale('s'))
+            return np.array(indices_or_times) - t0
+        else:
+            raise ValueError("mode must be 'index' or 'time'")
 
     def batch_process(self):
         QtWidgets.QMessageBox.information(self, "Batch", "Batch processing not implemented yet.")
@@ -837,9 +858,9 @@ def extract_baseline_value(y, method='mode', sample_size=10000):
         raise ValueError("Invalid method")
 
 #spike detect
-def wavelet_spike_detect(signal, fs, freq_range=(80, 250), threshold_std=3):
+def wavelet_spike_detect(signal, fs, freq_range=(80, 250), threshold_std=3, wavelet_name='morl'):
     scales = np.arange(1, 128)
-    coeffs, freqs = pywt.cwt(signal, scales, 'morl', sampling_period=1/fs)
+    coeffs, freqs = pywt.cwt(signal, scales, wavelet_name, sampling_period=1/fs)
     band_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
     band_energy = np.abs(coeffs[band_mask, :]).mean(axis=0)
 
