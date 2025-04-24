@@ -5,7 +5,7 @@ import pywt
 import numpy as np
 import pyqtgraph as pg
 from neo.io import NixIO
-from PyQt5 import QtWidgets,QtCore
+from PyQt5 import QtWidgets,QtCore,QtGui
 from PyQt5.QtCore import QSettings, QDir, Qt
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
@@ -17,7 +17,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.resize(1200, 800)
         self.signals = {}
         self.loaded_paths = set()
-        self.path_map = {}  # display_name -> path
+        self.path_map = {} 
         self.current_key = None
         self.raw_signal = None
         self.proc_key = None
@@ -27,6 +27,10 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.raw_plot.addLegend()
         self.raw_plot.plotItem.legend.setVisible(False)
         self.combo_wavelet.setCurrentText('cmor')
+
+        #signal interactivity
+        self.shortcut_auto_range = QtWidgets.QShortcut(QtGui.QKeySequence("A"), self)
+        self.shortcut_auto_range.activated.connect(self.reset_view)
 
         #Memory location and Load more data
         self.settings = QSettings('FileLocation', 'LFPAnalyzer')        
@@ -45,6 +49,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         # Left panel: File tree and operations
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_panel.setSizePolicy(QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding)
 
         # File tree outside label 
         lbl_tree = QtWidgets.QLabel('Current Data Files')
@@ -105,64 +110,86 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         # Reduce baseline UI (with checkbox and method combo)
         baseline_layout = QtWidgets.QHBoxLayout()
-
         self.chk_use_time = QtWidgets.QCheckBox("Set baseline by time")
         self.chk_use_time.setChecked(False)
         self.chk_use_time.stateChanged.connect(self.toggle_time_selector)
         baseline_layout.addWidget(self.chk_use_time)
+        baseline_layout.addStretch()  # Method right align
 
+        baseline_method_layout = QtWidgets.QHBoxLayout()
+        baseline_method_layout.addWidget(QtWidgets.QLabel("Method:"))
         self.combo_baseline_mode = QtWidgets.QComboBox()
         self.combo_baseline_mode.addItems(['mode', 'mean', 'median'])
-        baseline_layout.addWidget(QtWidgets.QLabel("Method:"))
-        baseline_layout.addWidget(self.combo_baseline_mode)
+        baseline_method_layout.addWidget(self.combo_baseline_mode)
+        baseline_layout.addLayout(baseline_method_layout)
 
-        left_layout.addLayout(baseline_layout) 
+        left_layout.addLayout(baseline_layout)
 
-        # Wavelet mother selection
-        wavelet_layout = QtWidgets.QHBoxLayout()
-        wavelet_layout.addWidget(QtWidgets.QLabel("Mother wavelet:"))
+        #wavelet controller
+        wavelet_group = QtWidgets.QGroupBox("Wavelet Settings")
+        wavelet_form = QtWidgets.QFormLayout()
 
+        # mother wavelet
         self.combo_wavelet = QtWidgets.QComboBox()
         self.combo_wavelet.addItems(['morl', 'cmor', 'mexh', 'gaus1'])
-        wavelet_layout.addWidget(self.combo_wavelet)
+        wavelet_form.addRow("Mother wavelet:", self.combo_wavelet)
 
-        left_layout.addLayout(wavelet_layout)
+        # Frequency
+        freq_range_layout = QtWidgets.QHBoxLayout()
+        freq_range_layout.setContentsMargins(0, 0, 0, 0)
+        self.freq_low = QtWidgets.QSpinBox()
+        self.freq_low.setRange(1, 1000)
+        self.freq_low.setValue(80)
+        self.freq_high = QtWidgets.QSpinBox()
+        self.freq_high.setRange(1, 2000)
+        self.freq_high.setValue(250)
+        freq_range_layout.addWidget(self.freq_low)
+        freq_range_layout.addWidget(QtWidgets.QLabel(" - "))
+        freq_range_layout.addWidget(self.freq_high)
+
+        freq_widget = QtWidgets.QWidget()
+        freq_widget.setLayout(freq_range_layout)
+        wavelet_form.addRow("Freq Range (Hz):", freq_widget)
+
+        # Threshold
+        self.wavelet_thresh = QtWidgets.QDoubleSpinBox()
+        self.wavelet_thresh.setRange(0.5, 10)
+        self.wavelet_thresh.setSingleStep(0.1)
+        self.wavelet_thresh.setValue(3.0)
+        wavelet_form.addRow("Threshold (SD):", self.wavelet_thresh)
+
+        wavelet_group.setLayout(wavelet_form)
+        left_layout.addWidget(wavelet_group)
 
         #Spike Clustering
+        filter_group = QtWidgets.QGroupBox("Spike Filter Settings")
+        filter_form = QtWidgets.QFormLayout()
+
         self.mergeSpikesCheckBox = QtWidgets.QCheckBox("Merge nearby spikes")
         self.mergeSpikesCheckBox.setChecked(True)
-        left_layout.addWidget(self.mergeSpikesCheckBox)
+        filter_form.addRow(self.mergeSpikesCheckBox)
 
-        # time interval
-        intervalLayout = QtWidgets.QHBoxLayout()
-        intervalLayout.addWidget(QtWidgets.QLabel("Min Interval (ms):"))
         self.minIntervalSpinBox = QtWidgets.QDoubleSpinBox()
         self.minIntervalSpinBox.setRange(1.0, 1000.0)
         self.minIntervalSpinBox.setSingleStep(1.0)
         self.minIntervalSpinBox.setValue(200.0)
-        intervalLayout.addWidget(self.minIntervalSpinBox)
-        left_layout.addLayout(intervalLayout)
-        
-        # relative threshold
-        relLayout = QtWidgets.QHBoxLayout()
-        relLayout.addWidget(QtWidgets.QLabel("Threshold (SE):"))
+        filter_form.addRow("Min Interval (ms):", self.minIntervalSpinBox)
+
+        self.minAmplitudeSpinBox = QtWidgets.QDoubleSpinBox()
+        self.minAmplitudeSpinBox.setRange(0.0, 1000.0)
+        self.minAmplitudeSpinBox.setValue(0.05)
+        self.minAmplitudeSpinBox.setSingleStep(0.01)
+        filter_form.addRow("Min Amplitude (mV):", self.minAmplitudeSpinBox)
+
         self.relThresholdSpinBox = QtWidgets.QDoubleSpinBox()
         self.relThresholdSpinBox.setRange(0, 10)
         self.relThresholdSpinBox.setDecimals(0)
         self.relThresholdSpinBox.setSingleStep(1)
         self.relThresholdSpinBox.setValue(0)
-        relLayout.addWidget(self.relThresholdSpinBox)
-        left_layout.addLayout(relLayout)
+        filter_form.addRow("Threshold (SE):", self.relThresholdSpinBox)
 
-        # mini amptitude
-        ampLayout = QtWidgets.QHBoxLayout()
-        ampLayout.addWidget(QtWidgets.QLabel("Min Amp:"))
-        self.minAmplitudeSpinBox = QtWidgets.QDoubleSpinBox()
-        self.minAmplitudeSpinBox.setRange(0.0, 1000.0)
-        self.minAmplitudeSpinBox.setValue(0.05)
-        self.minAmplitudeSpinBox.setSingleStep(0.01)
-        ampLayout.addWidget(self.minAmplitudeSpinBox)
-        left_layout.addLayout(ampLayout)
+        filter_group.setLayout(filter_form)
+        left_layout.addWidget(filter_group)
 
         # Batch processing button
         self.btn_batch = QtWidgets.QPushButton('Batch Process')
@@ -203,18 +230,27 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.raw_plot.scene().sigMouseMoved.connect(self.on_mouse_drag_move)
         self.proc_plot.scene().sigMouseMoved.connect(self.on_mouse_drag_move)
 
-
         # Operation buttons below processed plot
         op_layout = QtWidgets.QHBoxLayout()
         self.btn_smooth = QtWidgets.QPushButton('ALS Detrend')
         self.btn_align = QtWidgets.QPushButton("Zero Baseline")
         self.btn_detect = QtWidgets.QPushButton('Spike Detect')
+        self.btn_filter = QtWidgets.QPushButton('Filter Spikes')
+
         op_layout.addWidget(self.btn_smooth)
         op_layout.addWidget(self.btn_align)
         op_layout.addWidget(self.btn_detect)
+        op_layout.addWidget(self.btn_filter)
 
         right_layout.addLayout(op_layout)
         splitter.addWidget(right_panel)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+
+        # right stretch
+        splitter.setStretchFactor(0, 0)  
+        splitter.setStretchFactor(1, 1) 
+        splitter.setSizes([250, 950])
 
         # Connect signals to slots (to be implemented)
         self.btn_add.clicked.connect(self.load_file)
@@ -225,11 +261,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.btn_smooth.clicked.connect(self.apply_smooth)
         self.btn_align.clicked.connect(self.apply_zero_baseline)
         self.btn_detect.clicked.connect(self.apply_detect)
+        self.btn_filter.clicked.connect(self.apply_filter)
 
 # Methods
     #load file
     def load_single_file(self, path):
         """Load a single ABF or HDF5 file into the UI and signal dict."""
+        import copy
         try:
             ext = os.path.splitext(path)[1].lower()
             if ext == ".abf":
@@ -247,8 +285,11 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
             for i, seg in enumerate(block.segments):
                 if not seg.analogsignals:
-                    continue  # avoid blank segment
+                    continue
                 signal = seg.analogsignals[0]
+
+                # avoid contamination
+                signal = copy.deepcopy(signal)
 
                 display_name = self._generate_unique_name(f"{base_name}_sweep{i+1}")
                 self.signals[display_name] = signal
@@ -259,7 +300,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 item.setData(0, QtCore.Qt.UserRole, display_name)
                 self.file_tree.addTopLevelItem(item)
 
-                # first as current key
                 if self.current_key is None:
                     self.current_key = display_name
                     self.raw_signal = signal
@@ -385,20 +425,15 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
        
     #plot signal
     def _plot_signal(self, signal, plot, color='b', width=1, name=None, return_item=False):
-
         t = (signal.times - signal.t_start).rescale('s').magnitude.flatten()
         y = signal.magnitude.flatten()
 
         pen = pg.mkPen(color=color, width=width)
         plot.plot(t, y, pen=pen, name=name)
 
-        # units
-        if hasattr(signal, "units") and signal.units is not None:
-            plot.setLabel('left', f'Amplitude ({signal.units})')
-
         items = plot.listDataItems()
-        return items[-1] if items else None
-    
+        return items[-1] if items and return_item else None
+
     #plot patch
     def finalize_processing(self, proc_key, proc_signal, source_key):
         """renew outcome to proc_plot, origin to raw_plot"""
@@ -414,9 +449,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         if self.raw_signal is not None:
             self._plot_signal(self.raw_signal, self.raw_plot, color='b')
 
-        t = self.get_relative_time(proc_signal, proc_signal.times.rescale('s').magnitude, mode='time')
-        y = proc_signal.magnitude.flatten()
-        self.proc_plot.plot(t, y, pen=pg.mkPen('m'))
+        self._plot_signal(proc_signal, self.proc_plot, color='m')
 
         # file_tree select
         for i in range(self.file_tree.topLevelItemCount()):
@@ -425,7 +458,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             if key == proc_key:
                 self.file_tree.setCurrentItem(item)
                 break
-        
+
     def update_legend_visibility(self):
         """hide when select time for baseline"""
         show_legend = not self.chk_use_time.isChecked()
@@ -434,6 +467,12 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         if self.proc_plot.plotItem.legend is not None:
             self.proc_plot.plotItem.legend.setVisible(show_legend)
     
+    def reset_view(self):
+        for plot in [self.raw_plot, self.proc_plot]:
+            items = plot.listDataItems()
+            if not items:
+                continue
+
     def ensure_selector(self, name, plot, color=(0, 100, 255, 100)):
         if not hasattr(self, name) or getattr(self, name) is None:
             selector = pg.LinearRegionItem([0, 0.01], brush=color)
@@ -614,7 +653,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         if first_key:
             self.finalize_processing(first_key, first_signal, source_key=first_key.rsplit("_down", 1)[0])
 
-    
     #smooth
     def apply_smooth(self):
         from neo.core import AnalogSignal
@@ -850,25 +888,29 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         fs = float(signal.sampling_rate.rescale('Hz').magnitude)
 
         wavelet_name = self.combo_wavelet.currentText()
-        spike_idx = wavelet_spike_detect(y, fs, wavelet_name=wavelet_name)
-        spike_amps = y[spike_idx]
-        spike_times = self.get_relative_time(signal, spike_idx, mode='index')
+        low_f = self.freq_low.value()
+        high_f = self.freq_high.value()
+        threshold_std = self.wavelet_thresh.value()
 
-        if self.mergeSpikesCheckBox.isChecked():
-            min_interval = self.minIntervalSpinBox.value() / 1000.0
-            min_amp = self.minAmplitudeSpinBox.value()
-            se_factor = self.relThresholdSpinBox.value()
-
-            spike_times, spike_amps = cluster_spikes(
-                spike_times, spike_amps,
-                min_interval=min_interval,
-                min_amplitude=min_amp,
-                se_factor=se_factor
+        try:
+            spike_idx = wavelet_spike_detect(
+                y, fs,
+                freq_range=(low_f, high_f),
+                threshold_std=threshold_std,
+                wavelet_name=wavelet_name
             )
 
-        self.spike_times = spike_times
-        self.spike_amps = spike_amps
-        self.plot_detected_spikes()
+            if spike_idx is None or len(spike_idx) == 0:
+                QtWidgets.QMessageBox.information(self, "No Spikes", "No spikes detected in the current settings.")
+                return
+
+            self.spike_amps = y[spike_idx]
+            self.spike_times = self.get_relative_time(signal, spike_idx, mode='index')
+
+            self.plot_detected_spikes()
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Detection Error", f"Spike detection failed:\n{e}")
 
     def plot_detected_spikes(self):
         if self.proc_signal is None or self.spike_times is None:
@@ -883,6 +925,27 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.proc_plot.plot(t, y, pen=pg.mkPen('b'))
         self.proc_plot.plot(self.spike_times, self.spike_amps, pen=None,
                             symbol='o', symbolBrush='r', symbolSize=6, name="Spikes")
+
+
+    def apply_filter(self):
+        if self.spike_times is None or self.spike_amps is None:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No spike candidates to filter.")
+            return
+
+        min_interval = self.minIntervalSpinBox.value() / 1000.0
+        min_amp = self.minAmplitudeSpinBox.value()
+        se_factor = self.relThresholdSpinBox.value()
+
+        filtered_times, filtered_amps = cluster_spikes(
+            self.spike_times, self.spike_amps,
+            min_interval=min_interval,
+            min_amplitude=min_amp,
+            se_factor=se_factor
+        )
+
+        self.spike_times = filtered_times
+        self.spike_amps = filtered_amps
+        self.plot_detected_spikes()
 
     def get_relative_time(self, signal, indices_or_times, mode='index'):
         """Convert index or time array into relative time"""
@@ -939,9 +1002,44 @@ def extract_baseline_value(y, method='mode', sample_size=10000):
 
 #spike detect
 def wavelet_spike_detect(signal, fs, freq_range=(80, 250), threshold_std=3, wavelet_name='morl'):
-    scales = np.arange(1, 128)
-    coeffs, freqs = pywt.cwt(signal, scales, wavelet_name, sampling_period=1/fs)
+    if wavelet_name == "cmor":
+        wavelet_name = "cmor1.5-1.0"
+
+    wavelet = pywt.ContinuousWavelet(wavelet_name)
+
+    try:
+
+        low_f, high_f = freq_range
+        if low_f >= high_f or low_f <= 0:
+            return np.array([], dtype=int)
+
+        central_freq = pywt.central_frequency(wavelet)
+        if central_freq <= 0:
+            raise ValueError("Invalid central frequency")
+
+        min_scale = central_freq * fs / high_f
+        max_scale = central_freq * fs / low_f
+
+        if min_scale <= 0 or max_scale <= 0:
+            raise ValueError("Invalid scale range")
+
+        scale_start = int(np.floor(min_scale))
+        scale_end = int(np.ceil(max_scale)) + 1
+        if scale_end <= scale_start:
+            raise ValueError("Empty scale range")
+
+        scales = np.arange(scale_start, scale_end)
+
+    except Exception:
+        # fallback：fix mexh / gaus1
+        scales = np.arange(1, 128)
+
+    coeffs, freqs = pywt.cwt(signal, scales, wavelet, sampling_period=1/fs)
+
     band_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
+    if not np.any(band_mask):
+        return np.array([], dtype=int)
+
     band_energy = np.abs(coeffs[band_mask, :]).mean(axis=0)
 
     mean_val = np.mean(band_energy)
@@ -974,8 +1072,11 @@ def cluster_spikes(spike_times, spike_amps, min_interval=0.03, min_amplitude=0.0
         # Step 1: SE filter first
         if se_factor > 0 and len(group_amps) > 1:
             mean_amp = np.mean(group_amps)
-            std_amp = np.std(group_amps)
-            threshold = mean_amp + se_factor * std_amp
+            if len(group_amps) > 1:
+                se = np.std(group_amps) / np.sqrt(len(group_amps))
+                threshold = mean_amp + se_factor * se
+            else:
+                threshold = mean_amp
             keep_mask = group_amps >= threshold
         else:
             keep_mask = np.ones_like(group_amps, dtype=bool)
