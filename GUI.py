@@ -2,11 +2,13 @@ import sys
 import os
 import neo
 import pywt
+import h5py
 import numpy as np
 import pyqtgraph as pg
 from neo.io import NixIO
 from PyQt5 import QtWidgets,QtCore,QtGui
 from PyQt5.QtCore import QSettings, QDir, Qt
+from functools import partial
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 
@@ -18,23 +20,43 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.signals = {}
         self.loaded_paths = set()
         self.path_map = {} 
+        self.source_map = {}
         self.current_key = None
-        self.raw_signal = None
+        self.raw_signals = {}
         self.proc_key = None
         self.proc_signal = None
+        self.spike_info = {}
         self.baseline_curve = []
         self._create_main_layout()
         self.raw_plot.addLegend()
         self.raw_plot.plotItem.legend.setVisible(False)
         self.combo_wavelet.setCurrentText('cmor')
 
+        #enable drag
+        self.raw_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
+        self.proc_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
+
         #signal interactivity
         self.shortcut_auto_range = QtWidgets.QShortcut(QtGui.QKeySequence("A"), self)
         self.shortcut_auto_range.activated.connect(self.reset_view)
 
+        self.manual_spike_scatter = pg.ScatterPlotItem(size=8, brush=pg.mkBrush('#006400'))
+        self.proc_plot.addItem(self.manual_spike_scatter)
+
+        # Hover marker
+        self.hover_marker = pg.ScatterPlotItem(size=10, brush=pg.mkBrush(255, 0, 0, 100))
+        self.hover_marker.setVisible(False)
+        self.proc_plot.addItem(self.hover_marker)
+
+        # Redo manual mark
+        self.shortcut_undo_spike = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
+        self.shortcut_undo_spike.activated.connect(self.undo_manual_spike)
+        self.manual_spike_history = []
+
         #Memory location and Load more data
         self.settings = QSettings('FileLocation', 'LFPAnalyzer')        
         self.file_tree.itemClicked.connect(self.on_tree_item_clicked)
+
 
     #GUI
     def _create_main_layout(self):
@@ -191,6 +213,22 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         filter_group.setLayout(filter_form)
         left_layout.addWidget(filter_group)
 
+        # Manual Spike + Show Raw on same line
+        manual_layout = QtWidgets.QHBoxLayout()
+        self.chk_manual_spike = QtWidgets.QCheckBox("Manual Spike")
+        self.chk_manual_spike.setChecked(False)
+        self.chk_show_raw = QtWidgets.QCheckBox("Show Origin")
+        self.chk_show_raw.setChecked(False)
+        self.btn_save_proc = QtWidgets.QPushButton('Save Spike')
+        manual_layout.addWidget(self.chk_manual_spike)
+        manual_layout.addWidget(self.chk_show_raw)
+        manual_layout.addWidget(self.btn_save_proc)
+
+        left_layout.addLayout(manual_layout)
+        
+        self.chk_show_raw.stateChanged.connect(self.update_show_raw)
+        self.btn_save_proc.clicked.connect(self.save_proc_and_spike)
+
         # Batch processing button
         self.btn_batch = QtWidgets.QPushButton('Batch Process')
         left_layout.addWidget(self.btn_batch)
@@ -208,22 +246,23 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         # Raw signal plot
         self.raw_plot = pg.PlotWidget(title='Raw Signal')
         self.raw_plot.setBackground('w')  
-        self.raw_plot.mousePressEvent = lambda e: self.start_time_select(e, self.raw_plot)
-        self.raw_plot.mouseReleaseEvent = lambda e: self.end_time_select(e, self.raw_plot)
         right_layout.addWidget(self.raw_plot)
 
         # Processed signal plot
         self.proc_plot = pg.PlotWidget(title='Processed Signal')
         self.proc_plot.setBackground('w') 
+
+        #enable drag
+        self.bind_mouse_events(self.raw_plot)
+        self.bind_mouse_events(self.proc_plot)
+
         #sync
         self.proc_selector_fill = pg.LinearRegionItem([0, 0], brush=(0, 100, 255, 50))
         self.proc_selector_fill.setZValue(10)
         self.proc_selector_fill.setMovable(False)
         self.proc_selector_fill.setVisible(False)
         self.proc_plot.addItem(self.proc_selector_fill)
-        #mouse selection
-        self.proc_plot.mousePressEvent = lambda e: self.start_time_select(e, self.proc_plot)
-        self.proc_plot.mouseReleaseEvent = lambda e: self.end_time_select(e, self.proc_plot) 
+
         right_layout.addWidget(self.proc_plot)
 
         #draw selected area
@@ -262,37 +301,51 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.btn_align.clicked.connect(self.apply_zero_baseline)
         self.btn_detect.clicked.connect(self.apply_detect)
         self.btn_filter.clicked.connect(self.apply_filter)
+        self.chk_manual_spike.stateChanged.connect(self.update_spike_mode_link)
 
 # Methods
     #load file
     def load_single_file(self, path):
-        """Load a single ABF or HDF5 file into the UI and signal dict."""
-        import copy
+        """Load a single .abf or .h5 file into signals, raw_signals, and file tree."""
+        from copy import deepcopy
+        import neo
+
+        base_name = os.path.basename(path)
+        ext = os.path.splitext(path)[1].lower()
+
         try:
-            ext = os.path.splitext(path)[1].lower()
-            if ext == ".abf":
+            if ext == '.abf':
                 reader = neo.io.AxonIO(filename=path)
-            elif ext == ".h5":
+                block = reader.read_block(lazy=False)
+                reader = None
+            elif ext == '.h5':
                 reader = neo.io.NixIO(filename=path, mode='ro')
+                block = reader.read_block(lazy=False)
+                if not hasattr(self, 'h5_readers'):
+                    self.h5_readers = {}
+                self.h5_readers[path] = reader
             else:
-                QtWidgets.QMessageBox.warning(
-                    self, "Unsupported Format", f"Unsupported file type:\n{path}"
-                )
+                QtWidgets.QMessageBox.warning(self, "Warning", f"Unsupported file type: {ext}")
                 return
 
-            block = reader.read_block(lazy=False)
-            base_name = os.path.splitext(os.path.basename(path))[0]
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load Error", f"Failed to load {path}\n{e}")
+            return
 
+        try:
             for i, seg in enumerate(block.segments):
                 if not seg.analogsignals:
                     continue
+
                 signal = seg.analogsignals[0]
 
-                # avoid contamination
-                signal = copy.deepcopy(signal)
+                raw_copy = deepcopy(signal)
+                proc_copy = deepcopy(signal)
 
                 display_name = self._generate_unique_name(f"{base_name}_sweep{i+1}")
-                self.signals[display_name] = signal
+
+                self.raw_signals[display_name] = raw_copy
+                self.signals[display_name] = proc_copy
                 self.path_map[display_name] = path
                 self.loaded_paths.add(path)
 
@@ -300,17 +353,53 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 item.setData(0, QtCore.Qt.UserRole, display_name)
                 self.file_tree.addTopLevelItem(item)
 
+                # get spike
+                if ext == '.h5':
+                    self.load_spikes_from_h5(path, display_name)
+
+                # load and plot
                 if self.current_key is None:
                     self.current_key = display_name
-                    self.raw_signal = signal
-                    self.clear_raw_plot()
-                    self._plot_signal(signal, self.raw_plot, color='b')
+                    self.proc_key = display_name
+                    self.proc_signal = proc_copy
+                    self.raw_signal = raw_copy
+                    self.file_tree.setCurrentItem(item)
+                    self.on_tree_item_clicked(item, 0)
 
         except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Error", f"Failed to load:\n{os.path.basename(path)}\n\n{e}")
-    
+            QtWidgets.QMessageBox.critical(self, "Load Error", f"Error during parsing {path}\n{e}")
+
     #load method
+    def load_spikes_from_h5(self, path, key):
+        """Load saved spike info for a signal, only if available."""
+        import h5py
+        try:
+            with h5py.File(path, 'r') as f:
+                if 'spikes' not in f:
+                    return 
+
+                grp_spikes = f['spikes']
+
+                has_auto = 'auto' in grp_spikes and 'times' in grp_spikes['auto'] and 'amplitudes' in grp_spikes['auto']
+                has_manual = 'manual' in grp_spikes and 'times' in grp_spikes['manual'] and 'amplitudes' in grp_spikes['manual']
+
+                if not (has_auto or has_manual):
+                    return 
+
+                # if with spikes, new
+                self.spike_info[key] = {}
+
+                if has_auto:
+                    self.spike_info[key]['auto_times'] = grp_spikes['auto']['times'][:]
+                    self.spike_info[key]['auto_amps'] = grp_spikes['auto']['amplitudes'][:]
+
+                if has_manual:
+                    self.spike_info[key]['manual_times'] = grp_spikes['manual']['times'][:].tolist()
+                    self.spike_info[key]['manual_amps'] = grp_spikes['manual']['amplitudes'][:].tolist()
+
+        except Exception as e:
+            print(f"Warning: Failed to load spikes from {path}: {e}")
+
     def load_file(self):
         """Let user select multiple .abf or .h5 files for loading."""
         last_dir = self.settings.value('lastDir', QDir.homePath())
@@ -346,7 +435,45 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                     self.on_tree_item_clicked()
                     break
 
+    def find_original_raw_key(self, key):
+        while key in self.source_map:
+            key = self.source_map[key]
+        return key.split("_")[0]  # move index
+
     #save file
+    def closeEvent(self, event):
+        """Prompt to save before exiting. Close all resources."""
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            'Exit Confirmation',
+            "Do you want to save your work before exiting?",
+            QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Discard | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Save
+        )
+
+        if reply == QtWidgets.QMessageBox.Save:
+            self.save()
+            self.cleanup_resources()
+            event.accept()
+
+        elif reply == QtWidgets.QMessageBox.Discard:
+            # exit
+            self.cleanup_resources()
+            event.accept()
+
+        else:
+            # close
+            event.ignore()
+
+    def cleanup_resources(self):
+        """Close all open file readers safely."""
+        if hasattr(self, 'h5_readers'):
+            for reader in self.h5_readers.values():
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+
     def save(self):
         """Save selected signals as separate HDF5 files with auto-naming."""
         selected_items = self.file_tree.selectedItems()
@@ -354,51 +481,79 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected in the file tree.")
             return
 
-        # Select output folder
         last_dir = self.settings.value('lastSaveDir', QDir.homePath())
-        out_dir = QtWidgets.QFileDialog.getExistingDirectory(
-             self, "Select Output Folder", last_dir
-        )
+        out_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder", last_dir)
         if not out_dir:
             return
-        
-        self.settings.setValue('lastSaveDir', out_dir)
 
+        self.settings.setValue('lastSaveDir', out_dir)
         errors = []
 
         for item in selected_items:
             key = item.data(0, QtCore.Qt.UserRole)
-            if key not in self.signals:
-                errors.append(str(key))
+            signal = self.signals.get(key, None)
+            if signal is None:
+                errors.append(f"{key}: signal not found")
                 continue
 
-            signal = self.signals[key]
+            # name
+            base_name = key.replace('/', '_')
+            out_path = os.path.join(out_dir, f"{base_name}.h5")
 
-            # Auto-generated name
-            base_name = os.path.splitext(str(key))[0]
-            default_name = f"{base_name}.h5"
-            out_path = os.path.join(out_dir, default_name)
-
-            # Save individual signal to its own HDF5
             try:
-                io = NixIO(filename=out_path, mode='ow')
-                blk = neo.Block()
-                seg = neo.Segment()
-                seg.analogsignals.append(signal)
-                blk.segments.append(seg)
-                io.write_block(blk)
-                io.close()
+                self._save_signal_to_h5(signal, out_path, key)
             except Exception as e:
-                errors.append(f"{default_name}: {str(e)}")
+                errors.append(f"{base_name}.h5: {e}")
 
-        # Final report
         if errors:
-            QtWidgets.QMessageBox.warning(
-                self, "Partial Save",
-                f"Some files failed to save:\n" + "\n".join(errors))
+            QtWidgets.QMessageBox.warning(self, "Partial Save", "Some files failed to save:\n" + "\n".join(errors))
         else:
             QtWidgets.QMessageBox.information(self, "Success", "All selected signals saved successfully.")
 
+    def _save_signal_to_h5(self, signal, out_path, key):
+        # clear
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+        blk = neo.Block(name=f"block_{key}")
+        seg = neo.Segment(name=f"seg_{key}")
+        signal.name = f"sig_{key}"
+        seg.analogsignals.append(signal)
+        blk.segments.append(seg)
+        with NixIO(filename=out_path, mode='ow') as io:
+            io.write_block(blk)
+
+        info = self.spike_info.get(key, None)
+        if info is None:
+            return
+
+        auto_times  = info.get('auto_times',  None)
+        auto_amps   = info.get('auto_amps',   None)
+        manual_times = info.get('manual_times', [])
+        manual_amps  = info.get('manual_amps',  [])
+
+        # 如果既没自动也没手动，就不创建 spikes 组
+        has_auto   = (auto_times is not None and getattr(auto_times, 'size', len(auto_times)) > 0)
+        has_manual = (len(manual_times) > 0)
+
+        if not (has_auto or has_manual):
+            return
+
+        with h5py.File(out_path, 'a') as f:
+            if 'spikes' in f:
+                del f['spikes']
+            grp_spikes = f.create_group('spikes')
+
+            if has_auto:
+                g_auto = grp_spikes.create_group('auto')
+                g_auto.create_dataset('times',      data=auto_times)
+                g_auto.create_dataset('amplitudes', data=auto_amps)
+
+            if has_manual:
+                g_man = grp_spikes.create_group('manual')
+                g_man.create_dataset('times',      data=manual_times)
+                g_man.create_dataset('amplitudes', data=manual_amps)
+   
     #remove
     def remove_file(self):
         """Remove selected signal(s) from tree, memory, and path map."""
@@ -436,22 +591,32 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
     #plot patch
     def finalize_processing(self, proc_key, proc_signal, source_key):
-        """renew outcome to proc_plot, origin to raw_plot"""
         self.proc_key = proc_key
         self.proc_signal = proc_signal
         self.current_key = source_key
-        self.raw_signal = self.signals.get(source_key)
 
-        # plot
         self.clear_raw_plot()
         self.clear_proc_plot()
 
+        if self.chk_show_raw.isChecked():
+            # origin
+            origin_base_key = self.find_original_raw_key(source_key)
+            self.raw_signal = self.raw_signals.get(origin_base_key, None)
+        else:
+            # last
+            prev_key = self.source_map.get(source_key, None)
+            self.raw_signal = self.signals.get(prev_key, None)
+
+        # raw plot
         if self.raw_signal is not None:
             self._plot_signal(self.raw_signal, self.raw_plot, color='b')
 
+        # processed plot
         self._plot_signal(proc_signal, self.proc_plot, color='m')
 
-        # file_tree select
+        self.reset_proc_view()
+
+        # click tree item
         for i in range(self.file_tree.topLevelItemCount()):
             item = self.file_tree.topLevelItem(i)
             key = item.data(0, QtCore.Qt.UserRole)
@@ -469,9 +634,19 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
     
     def reset_view(self):
         for plot in [self.raw_plot, self.proc_plot]:
-            items = plot.listDataItems()
-            if not items:
-                continue
+            if plot.listDataItems():
+                plot.enableAutoRange(axis='xy')
+                plot.plotItem.vb.setMouseEnabled(x=not self.chk_use_time.isChecked(), y=not self.chk_use_time.isChecked())
+
+    def reset_proc_view(self):
+        if self.proc_plot.listDataItems():
+            self.proc_plot.enableAutoRange(axis='xy')
+            self.proc_plot.plotItem.vb.setMouseEnabled(x=not self.chk_use_time.isChecked(), y=not self.chk_use_time.isChecked())
+
+    def reset_raw_view(self):
+        if self.raw_plot.listDataItems():
+            self.raw_plot.enableAutoRange(axis='xy')
+            self.raw_plot.plotItem.vb.setMouseEnabled(x=not self.chk_use_time.isChecked(), y=not self.chk_use_time.isChecked())
 
     def ensure_selector(self, name, plot, color=(0, 100, 255, 100)):
         if not hasattr(self, name) or getattr(self, name) is None:
@@ -498,26 +673,35 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         return name
 
     #file tree
-    def on_tree_item_clicked(self, *_):
-        selected = self.file_tree.selectedItems()
-        if not selected:
+    def on_tree_item_clicked(self, item=None, column=0):
+        """Update plots when clicking an item."""
+        if item is None:
+            item = self.file_tree.currentItem()
+            if item is None:
+                return
+
+        key = item.data(0, QtCore.Qt.UserRole)
+
+        if key not in self.signals:
             return
 
-        top_item = selected[0]
-        display_name = top_item.data(0, QtCore.Qt.UserRole)
-        if display_name not in self.signals:
-            return
+        self.current_key = key
+        self.proc_key = key
+        self.proc_signal = self.signals.get(key, None)
+        self.raw_signal = self.raw_signals.get(key, None)
 
-        signal = self.signals[display_name]
-        self.current_key = display_name
-        self.raw_signal = signal
-
-        # renew raw
+        self.clear_proc_plot()
         self.clear_raw_plot()
-        self._plot_signal(signal, self.raw_plot, color='b')
 
-        # maintain proc
-        self.raw_plot.plotItem.vb.enableAutoRange(axis='xy')
+        # raw
+        if self.raw_signal is not None:
+            t = (self.raw_signal.times - self.raw_signal.t_start).rescale('s').magnitude.flatten()
+            y = self.raw_signal.magnitude[:, 0].flatten()
+            self.raw_plot.plot(t, y, pen=pg.mkPen('k'))
+
+        # proc
+        if self.proc_signal is not None:
+            self.plot_detected_spikes()
 
     #tree right click open menu
     #menu
@@ -533,7 +717,41 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.clear_and_reload()
         elif action == overlay_action:
             self.overlay_selected_signals()
-   
+    #add new
+    def _add_signal_to_tree(self, display_name, signal):
+        self.signals[display_name] = signal
+        item = QtWidgets.QTreeWidgetItem([display_name])
+        item.setData(0, QtCore.Qt.UserRole, display_name)
+        self.file_tree.addTopLevelItem(item)
+    def save_proc_and_spike(self):
+        """Save current processed signal and spike into tree view (internal save)."""
+        if self.proc_signal is None:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No processed signal to save.")
+            return
+
+        from copy import deepcopy
+
+        new_signal = deepcopy(self.proc_signal)
+        new_key = self._generate_unique_name(f"{self.proc_key}_saved")
+
+        self.signals[new_key] = new_signal
+
+        # 登记source_map！
+        self.source_map[new_key] = self.proc_key
+
+        if self.proc_key in self.spike_info:
+            self.spike_info[new_key] = deepcopy(self.spike_info[self.proc_key])
+
+        if self.proc_key in self.raw_signals:
+            self.raw_signals[new_key] = deepcopy(self.raw_signals[self.proc_key])
+
+        if self.proc_key in self.path_map:
+            self.path_map[new_key] = self.path_map[self.proc_key]
+
+        item = QtWidgets.QTreeWidgetItem([new_key])
+        item.setData(0, QtCore.Qt.UserRole, new_key)
+        self.file_tree.addTopLevelItem(item)
+
     #clear&reload
     def clear_and_reload(self):
         self.file_tree.clear()
@@ -557,14 +775,24 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
     def clear_raw_plot(self):
         self.clear_plot_with_selector('raw_plot', 'time_selector')
     def clear_proc_plot(self):
-        self.clear_plot_with_selector('proc_plot', 'proc_selector_fill')
-    
+        self.proc_plot.clear()
+
+        if hasattr(self, "proc_selector_fill") and self.proc_selector_fill is not None:
+            self.proc_plot.addItem(self.proc_selector_fill)
+
+        if hasattr(self, "hover_marker") and self.hover_marker is not None:
+            self.proc_plot.addItem(self.hover_marker)
+
+        if hasattr(self, "manual_spike_scatter") and self.manual_spike_scatter is not None:
+            self.proc_plot.addItem(self.manual_spike_scatter)
+
     #overlay
     def overlay_selected_signals(self):
+        """Overlay multiple selected signals in raw_plot, with clickable legend toggle."""
         if self.baseline_curve is not None:
             self.raw_plot.removeItem(self.baseline_curve)
             self.baseline_curve = []
-            
+
         selected_items = self.file_tree.selectedItems()
         if not selected_items:
             QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected.")
@@ -572,6 +800,9 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         self.raw_plot.clear()
         legend = self.raw_plot.plotItem.legend
+        if legend is not None:
+            legend.clear()
+
         colors = ['b', 'r', 'm', 'c', 'y', 'k']
         color_cycle = iter(colors * 10)
 
@@ -581,12 +812,28 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             key = item.data(0, QtCore.Qt.UserRole)
             if key not in self.signals:
                 continue
+
             signal = self.signals[key]
-            t = signal.times.rescale('s').magnitude.flatten()
-            y = signal.magnitude.flatten()
-            pen = pg.mkPen(color=next(color_cycle), width=1)
-            curve = self.raw_plot.plot(t, y, pen=pen, name=key)
+            curve = self._plot_signal(signal, self.raw_plot, color=next(color_cycle), name=key, return_item=True)
             self.overlay_curves[key] = curve
+
+        # Set last selected as current
+        last_key = selected_items[-1].data(0, QtCore.Qt.UserRole)
+        if last_key in self.signals:
+            self.current_key = last_key
+            self.raw_signal = self.signals[last_key]
+            self.proc_signal = None
+
+        # Bind legend label click to toggle curve visibility
+        if legend is not None:
+            for sample in legend.items:
+                _, label = sample
+                text = label.text
+                if text in self.overlay_curves:
+                    curve = self.overlay_curves[text]
+                    label.mousePressEvent = partial(toggle_curve_visibility, curve=curve)
+
+        self.update_legend_visibility()
 
         # renew current_key
         last_key = selected_items[-1].data(0, QtCore.Qt.UserRole)
@@ -606,7 +853,29 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         self.update_legend_visibility()  # click box depend
 
-    #Utility         
+    #Utility
+    def create_processed_signal(self, original_key, processed_magnitude, suffix):
+        from neo.core import AnalogSignal
+        original_signal = self.signals[original_key]
+
+        new_signal = AnalogSignal(
+            processed_magnitude.reshape(-1, 1),
+            units=original_signal.units,
+            sampling_rate=original_signal.sampling_rate,
+            t_start=original_signal.t_start,
+            name=f"{original_signal.name}_{suffix}" if original_signal.name else None
+        )
+
+        new_key = self._generate_unique_name(f"{original_key}_{suffix}")
+        self.signals[new_key] = new_signal
+        self.source_map[new_key] = original_key  # orign
+
+        item_new = QtWidgets.QTreeWidgetItem([new_key])
+        item_new.setData(0, QtCore.Qt.UserRole, new_key)
+        self.file_tree.addTopLevelItem(item_new)
+
+        return new_key, new_signal
+         
     #size reduce
     def apply_downsample(self):
         selected_items = self.file_tree.selectedItems()
@@ -615,8 +884,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             return
 
         factor = self.spin_down.value()
-        from neo.core import AnalogSignal
-        import quantities as pq
 
         first_key = None
         first_signal = None
@@ -626,38 +893,22 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             if key not in self.signals:
                 continue
 
-            orig = self.signals[key]
-            try:
-                new_signal = AnalogSignal(
-                    orig.magnitude[::factor],
-                    units=orig.units,
-                    sampling_rate=orig.sampling_rate / factor,
-                    t_start=orig.t_start,
-                    name=f"{orig.name}_down{factor}x" if orig.name else None
-                )
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "Error", f"{key} downsample failed:\n{e}")
-                continue
+            original_signal = self.signals[key]
+            new_magnitude = original_signal.magnitude[::factor]
 
-            display_name = self._generate_unique_name(f"{key}_down{factor}x")
-            self.signals[display_name] = new_signal
+            # sampling_rate remove factor
+            original_signal.sampling_rate /= factor
 
-            item_new = QtWidgets.QTreeWidgetItem([display_name])
-            item_new.setData(0, QtCore.Qt.UserRole, display_name)
-            self.file_tree.addTopLevelItem(item_new)
+            new_key, new_signal = self.create_processed_signal(key, new_magnitude, f"down{factor}x")
 
             if first_key is None:
-                first_key = display_name
-                first_signal = new_signal
+                first_key, first_signal = new_key, new_signal
 
         if first_key:
-            self.finalize_processing(first_key, first_signal, source_key=first_key.rsplit("_down", 1)[0])
+            self.finalize_processing(first_key, first_signal, source_key=first_key)
 
     #smooth
     def apply_smooth(self):
-        from neo.core import AnalogSignal
-        import quantities as pq
-
         selected_items = self.file_tree.selectedItems()
         if not selected_items:
             QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected.")
@@ -676,50 +927,27 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             if key not in self.signals:
                 continue
 
-            raw_signal = self.signals[key]
-            y = raw_signal.magnitude.flatten()
+            signal = self.signals[key]
+            baseline = als_baseline(signal.magnitude.flatten(), lam=lam, p=p)
+            detrended = signal.magnitude.flatten() - baseline
 
-            try:
-                baseline = als_baseline(y, lam=lam, p=p)
-                detrended = y - baseline
+            new_key, new_signal = self.create_processed_signal(key, detrended, "als")
 
-                smoothed_signal = AnalogSignal(
-                    detrended.reshape(-1, 1),
-                    units=raw_signal.units,
-                    sampling_rate=raw_signal.sampling_rate,
-                    t_start=raw_signal.t_start,
-                    name=f"{raw_signal.name}_als" if raw_signal.name else None
-                )
-
-                display_name = self._generate_unique_name(f"{key}_als")
-                self.signals[display_name] = smoothed_signal
-
-                item_new = QtWidgets.QTreeWidgetItem([display_name])
-                item_new.setData(0, QtCore.Qt.UserRole, display_name)
-                self.file_tree.addTopLevelItem(item_new)
-
-                if first_key is None:
-                    first_key = display_name
-                    first_signal = smoothed_signal
-
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "ALS Error", f"{key} failed:\n{e}")
+            if first_key is None:
+                first_key, first_signal = new_key, new_signal
 
         if first_key:
-            self.finalize_processing(first_key, first_signal, source_key=first_key.rsplit("_als", 1)[0])
+            self.finalize_processing(first_key, first_signal, source_key=first_key)
 
-    #remove baseline
     def apply_zero_baseline(self):
-        from neo.core import AnalogSignal
-
         selected_items = self.file_tree.selectedItems()
         if not selected_items:
             QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected.")
             return
 
         method = self.combo_baseline_mode.currentText()
-        first_key = None
-        first_signal = None
+
+        first_key, first_signal = None, None
 
         for item in selected_items:
             key = item.data(0, QtCore.Qt.UserRole)
@@ -730,8 +958,9 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             signal = self.signals[key]
             y = signal.magnitude.flatten()
 
-            self.current_key = key  # get for extract_data_from_time_range
+            self.current_key = key
             sample_values = self.extract_data_from_time_range()
+
             if sample_values is None or len(sample_values) == 0:
                 sample_values = y
 
@@ -739,27 +968,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             centered = y - baseline_val
             centered = np.clip(centered, 0, None)
 
-            aligned_signal = AnalogSignal(
-                centered.reshape(-1, 1),
-                units=signal.units,
-                sampling_rate=signal.sampling_rate,
-                t_start=signal.t_start,
-                name=f"{signal.name}_zeroed" if signal.name else None
-            )
-
-            display_name = self._generate_unique_name(f"{key}_zeroed")
-            self.signals[display_name] = aligned_signal
-
-            item_new = QtWidgets.QTreeWidgetItem([display_name])
-            item_new.setData(0, QtCore.Qt.UserRole, display_name)
-            self.file_tree.addTopLevelItem(item_new)
+            new_key, new_signal = self.create_processed_signal(key, centered, "zeroed")
 
             if first_key is None:
-                first_key = display_name
-                first_signal = aligned_signal
+                first_key, first_signal = new_key, new_signal
 
         if first_key:
-            self.finalize_processing(first_key, first_signal, source_key=first_key.rsplit("_zeroed", 1)[0])
+            self.finalize_processing(first_key, first_signal, source_key=first_key)
 
     #baseline time selector
     def toggle_time_selector(self, state):
@@ -798,6 +1013,24 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         return y[mask] if np.any(mask) else y
 
     #mouse event
+    def bind_mouse_events(self, plot):
+        plot.mousePressEvent = lambda e: self.handle_mouse_event(e, plot)
+        plot.mouseReleaseEvent = lambda e: self.handle_mouse_release(e, plot)
+
+    def handle_mouse_event(self, event, plot):
+        if self.chk_manual_spike.isChecked() and plot == self.proc_plot:
+            self.handle_manual_spike_click(event)
+        elif self.chk_use_time.isChecked() and event.button() == Qt.LeftButton:
+            self.start_time_select(event, plot)
+        else:
+            super(pg.PlotWidget, plot).mousePressEvent(event)
+
+    def handle_mouse_release(self, event, plot):
+        if self.chk_use_time.isChecked() and event.button() == Qt.LeftButton:
+            self.end_time_select(event, plot)
+        else:
+            super(pg.PlotWidget, plot).mouseReleaseEvent(event)
+
     def start_time_select(self, event, plot):
         if event.button() != Qt.LeftButton:
             return
@@ -850,24 +1083,30 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.proc_selector_fill.setVisible(True)
 
     def on_mouse_drag_move(self, pos):
-        if self._drag_start is None or not self.chk_use_time.isChecked():
-            return
+        if self.proc_plot.plotItem.vb.sceneBoundingRect().contains(pos):
+            mouse_point = self.proc_plot.plotItem.vb.mapSceneToView(pos)
+            x = mouse_point.x()
+            y = mouse_point.y()
 
-        for plot in [self.raw_plot, self.proc_plot]:
-            vb = plot.plotItem.vb
-            if vb.sceneBoundingRect().contains(pos):
-                mouse_point = vb.mapToView(pos)
-                x = mouse_point.x()
-                x0 = self._drag_start
-                x1 = x
-                region = [min(x0, x1), max(x0, x1)]
+            if self.chk_manual_spike.isChecked():
+                self.update_hover_marker(x, y)
+            else:
+                self.hover_marker.setVisible(False)
 
-                # selector exist
-                self.time_selector = self.ensure_selector("time_selector", self.raw_plot)
-                self.proc_selector_fill = self.ensure_selector("proc_selector_fill", self.proc_plot)
-
-                self.update_selector_region(region)
-                break
+        # time select
+        if self._drag_start is not None and self.chk_use_time.isChecked():
+            for plot in [self.raw_plot, self.proc_plot]:
+                vb = plot.plotItem.vb
+                if vb.sceneBoundingRect().contains(pos):
+                    mouse_point = vb.mapToView(pos)
+                    x = mouse_point.x()
+                    x0 = self._drag_start
+                    x1 = x
+                    region = [min(x0, x1), max(x0, x1)]
+                    self.time_selector = self.ensure_selector("time_selector", self.raw_plot)
+                    self.proc_selector_fill = self.ensure_selector("proc_selector_fill", self.proc_plot)
+                    self.update_selector_region(region)
+                    break
 
     def sync_xrange(self, source_plot):
         """sync x axis"""
@@ -875,14 +1114,125 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         target_plot = self.proc_plot if source_plot == self.raw_plot else self.raw_plot
         target_plot.setXRange(x_min, x_max, padding=0)
 
+    def handle_manual_spike_click(self, event):
+        """Handle left/right click for manual spike add/remove."""
+        if event.button() not in (Qt.LeftButton, Qt.RightButton):
+            return
+
+        if self.proc_signal is None or self.hover_spike is None:
+            return
+
+        click_x, click_y = self.hover_spike
+
+        info = self.get_spike_info(create=True)
+
+        if event.button() == Qt.LeftButton:
+            # manual spike
+            info['manual_times'].append(click_x)
+            info['manual_amps'].append(click_y)
+            self.update_manual_spike_scatter()
+
+        elif event.button() == Qt.RightButton:
+            self.delete_nearest_spike(click_x, click_y)
+
+    def delete_nearest_manual_spike(self, click_x, click_y):
+        """Delete the nearest manually marked spike."""
+        if self.proc_key not in self.spike_info:
+            return
+
+        info = self.spike_info[self.proc_key]
+        manual_times = info.get('manual_times', [])
+        manual_amps = info.get('manual_amps', [])
+
+        if not manual_times:
+            return
+
+        distances = np.sqrt((np.array(manual_times) - click_x) ** 2 + (np.array(manual_amps) - click_y) ** 2)
+        min_idx = np.argmin(distances)
+
+        pixel_scale_x = (self.proc_plot.plotItem.vb.viewRange()[0][1] - self.proc_plot.plotItem.vb.viewRange()[0][0]) / self.proc_plot.width()
+        pixel_scale_y = (self.proc_plot.plotItem.vb.viewRange()[1][1] - self.proc_plot.plotItem.vb.viewRange()[1][0]) / self.proc_plot.height()
+        pixel_radius = np.sqrt((20 * pixel_scale_x) ** 2 + (20 * pixel_scale_y) ** 2)
+
+        if distances[min_idx] > pixel_radius:
+            return 
+
+        # delete
+        del manual_times[min_idx]
+        del manual_amps[min_idx]
+
+        self.update_manual_spike_scatter()
+
+    def undo_manual_spike(self):
+        """Undo the last manually added spike."""
+        info = self.get_spike_info()
+        if info is None:
+            return
+
+        manual_times = info.get('manual_times', [])
+        manual_amps = info.get('manual_amps', [])
+
+        if not manual_times:
+            return
+
+        manual_times.pop()
+        manual_amps.pop()
+        self.update_manual_spike_scatter()
+
+
     #spike detect
+    def get_spike_info(self, key=None, create=False):
+        """Get spike_info dict for the given key (default current), optionally create if missing."""
+        if key is None:
+            key = self.proc_key
+
+        if key is None:
+            return None
+
+        if create:
+            self.spike_info.setdefault(key, {})
+            info = self.spike_info[key]
+            info.setdefault('auto_times', None)
+            info.setdefault('auto_amps', None)
+            info.setdefault('manual_times', [])
+            info.setdefault('manual_amps', [])
+            return info
+        else:
+            return self.spike_info.get(key, None)
+
+    def update_auto_spikes(self, times, amps, key=None):
+        """Update auto-detected spikes for the given key."""
+        info = self.get_spike_info(key=key, create=True)
+        info['auto_times'] = times
+        info['auto_amps'] = amps
+
+    def update_manual_spike_scatter(self):
+        """Update manual spike scatter points."""
+        info = self.get_spike_info()
+        if info is None:
+            self.manual_spike_scatter.clear()
+            return
+
+        manual_times = info.get('manual_times', [])
+        manual_amps = info.get('manual_amps', [])
+
+        spots = [{'pos': (x, y)} for x, y in zip(manual_times, manual_amps)]
+        self.manual_spike_scatter.setData(spots)
+
+    def update_spike_mode_link(self, state):
+        """When manual spike marking is enabled, link raw/proc x-axis. Otherwise unlink."""
+        if state == Qt.Checked:
+            self.proc_plot.setXLink(self.raw_plot)  
+        else:
+            self.proc_plot.setXLink(None)            
+
     def apply_detect(self):
         if self.proc_key is None or self.proc_key not in self.signals:
             QtWidgets.QMessageBox.warning(self, "Warning", "No processed signal found. Please run ALS or Zero Baseline first.")
             return
 
         signal = self.signals[self.proc_key]
-        self.proc_signal = signal
+        self.proc_signal = signal  # renew proc_signal
 
         y = signal.magnitude.flatten()
         fs = float(signal.sampling_rate.rescale('Hz').magnitude)
@@ -904,16 +1254,23 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.information(self, "No Spikes", "No spikes detected in the current settings.")
                 return
 
-            self.spike_amps = y[spike_idx]
-            self.spike_times = self.get_relative_time(signal, spike_idx, mode='index')
+            auto_times = self.get_relative_time(signal, spike_idx, mode='index')
+            auto_amps = y[spike_idx]
 
+            if len(auto_times) == 0 or len(auto_amps) == 0:
+                QtWidgets.QMessageBox.information(self, "No Spikes", "No spikes detected in the current settings.")
+                return
+
+            self.update_auto_spikes(auto_times, auto_amps)
             self.plot_detected_spikes()
 
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Detection Error", f"Spike detection failed:\n{e}")
 
     def plot_detected_spikes(self):
-        if self.proc_signal is None or self.spike_times is None:
+        """Plot current processed signal with auto and manual spikes."""
+        
+        if self.proc_signal is None:
             return
 
         self.clear_proc_plot()
@@ -923,13 +1280,41 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         y = signal.magnitude.flatten()
 
         self.proc_plot.plot(t, y, pen=pg.mkPen('b'))
-        self.proc_plot.plot(self.spike_times, self.spike_amps, pen=None,
-                            symbol='o', symbolBrush='r', symbolSize=6, name="Spikes")
 
+        info = self.spike_info.get(self.proc_key, {})
+
+        auto_times = info.get('auto_times', None)
+        auto_amps = info.get('auto_amps', None)
+
+        if auto_times is not None and len(auto_times) > 0:
+            self.proc_plot.plot(
+                auto_times, auto_amps,
+                pen=None, symbol='o', symbolBrush='r', symbolSize=6, name="Auto Spikes"
+            )
+
+        manual_times = info.get('manual_times', None)
+        manual_amps = info.get('manual_amps', None)
+
+        if manual_times is not None and len(manual_times) > 0:
+            self.proc_plot.plot(
+                manual_times, manual_amps,
+                pen=None, symbol='x', symbolBrush='g', symbolSize=8, name="Manual Spikes"
+            )
+
+        self.reset_view()
 
     def apply_filter(self):
-        if self.spike_times is None or self.spike_amps is None:
+        """Apply amplitude and clustering filter to detected spikes for the current signal."""
+        info = self.get_spike_info()
+        if info is None:
             QtWidgets.QMessageBox.warning(self, "Warning", "No spike candidates to filter.")
+            return
+
+        auto_times = info.get('auto_times', None)
+        auto_amps = info.get('auto_amps', None)
+
+        if auto_times is None or auto_amps is None or len(auto_times) == 0:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No detected spikes to filter.")
             return
 
         min_interval = self.minIntervalSpinBox.value() / 1000.0
@@ -937,14 +1322,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         se_factor = self.relThresholdSpinBox.value()
 
         filtered_times, filtered_amps = cluster_spikes(
-            self.spike_times, self.spike_amps,
+            auto_times, auto_amps,
             min_interval=min_interval,
             min_amplitude=min_amp,
             se_factor=se_factor
         )
 
-        self.spike_times = filtered_times
-        self.spike_amps = filtered_amps
+        self.update_auto_spikes(filtered_times, filtered_amps)
         self.plot_detected_spikes()
 
     def get_relative_time(self, signal, indices_or_times, mode='index'):
@@ -957,6 +1341,110 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             return np.array(indices_or_times) - t0
         else:
             raise ValueError("mode must be 'index' or 'time'")
+
+    def update_hover_marker(self, x, y):
+        """In full signal, find nearest local max around mouse, update hover marker."""
+        if self.proc_signal is None:
+            self.hover_marker.setVisible(False)
+            self.hover_spike = None
+            return
+
+        t = self.get_relative_time(self.proc_signal, self.proc_signal.times.rescale('s').magnitude, mode='time')
+        ydata = self.proc_signal.magnitude.flatten()
+
+        # locate
+        pixel_scale_x = (self.proc_plot.plotItem.vb.viewRange()[0][1] - self.proc_plot.plotItem.vb.viewRange()[0][0]) / self.proc_plot.width()
+        pixel_scale_y = (self.proc_plot.plotItem.vb.viewRange()[1][1] - self.proc_plot.plotItem.vb.viewRange()[1][0]) / self.proc_plot.height()
+
+        # scale
+        tol_x = 20 * pixel_scale_x
+        tol_y = 20 * pixel_scale_y
+
+        # get data point
+        mask = (np.abs(t - x) <= tol_x) & (np.abs(ydata - y) <= tol_y)
+
+        if not np.any(mask):
+            self.hover_marker.setVisible(False)
+            self.hover_spike = None
+            return
+
+        # get max
+        candidate_idx = np.where(mask)[0]
+        best_idx = candidate_idx[np.argmax(ydata[candidate_idx])]
+
+        best_x = t[best_idx]
+        best_y = ydata[best_idx]
+
+        # refresh hover marker
+        self.hover_marker.setData([{'pos': (best_x, best_y)}])
+        self.hover_marker.setVisible(True)
+        self.hover_spike = (best_x, best_y)
+
+    def update_manual_spike_scatter(self):
+        """Update manual spike scatter points."""
+        if self.proc_key not in self.spike_info:
+            self.manual_spike_scatter.clear()
+            return
+
+        info = self.spike_info[self.proc_key]
+        manual_times = info.get('manual_times', [])
+        manual_amps = info.get('manual_amps', [])
+
+        spots = [{'pos': (x, y)} for x, y in zip(manual_times, manual_amps)]
+        self.manual_spike_scatter.setData(spots)
+
+    def delete_nearest_spike(self, click_x, click_y):
+        """Delete the nearest spike (auto or manual) under cursor."""
+        info = self.get_spike_info()
+        if info is None:
+            return
+
+        auto_times = info.get('auto_times', [])
+        auto_amps = info.get('auto_amps', [])
+        manual_times = info.get('manual_times', [])
+        manual_amps = info.get('manual_amps', [])
+
+        all_times = np.concatenate([auto_times, manual_times])
+        all_amps = np.concatenate([auto_amps, manual_amps])
+
+        if len(all_times) == 0:
+            return
+
+        distances = np.sqrt((all_times - click_x) ** 2 + (all_amps - click_y) ** 2)
+        min_idx = np.argmin(distances)
+
+        # auto or manual 
+        if min_idx < len(auto_times):
+            # delete auto spike
+            info['auto_times'] = np.delete(auto_times, min_idx)
+            info['auto_amps'] = np.delete(auto_amps, min_idx)
+        else:
+            idx = min_idx - len(auto_times)
+            manual_times.pop(idx)
+            manual_amps.pop(idx)
+
+        self.plot_detected_spikes()
+
+    def update_show_raw(self):
+        """Show or hide original saved raw signal."""
+        self.raw_plot.clear()
+
+        if self.chk_show_raw.isChecked() and self.current_key is not None:
+            # find
+            raw_signal = self.raw_signals.get(self.current_key)
+
+            if raw_signal is None:
+                # move suffix
+                base_key = self.current_key.split("_saved")[0]
+                raw_signal = self.raw_signals.get(base_key)
+
+            if raw_signal is None:
+                return
+
+            t = (raw_signal.times - raw_signal.t_start).rescale('s').magnitude.flatten()
+            y = raw_signal.magnitude[:, 0].flatten()
+
+            self.raw_plot.plot(t, y, pen=pg.mkPen('k'))
 
     def batch_process(self):
         QtWidgets.QMessageBox.information(self, "Batch", "Batch processing not implemented yet.")
@@ -1092,6 +1580,10 @@ def cluster_spikes(spike_times, spike_amps, min_interval=0.03, min_amplitude=0.0
         i = group_end
 
     return np.array(filtered_times), np.array(filtered_amps)
+
+#overlay visibility
+def toggle_curve_visibility(event, curve):
+    curve.setVisible(not curve.isVisible())
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
