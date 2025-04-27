@@ -19,6 +19,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.resize(1200, 800)
         self.signals = {}
         self.loaded_paths = set()
+        self.last_folder = None
         self.path_map = {} 
         self.source_map = {}
         self.current_key = None
@@ -230,6 +231,21 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.chk_show_raw.stateChanged.connect(self.update_show_raw)
         self.btn_save_proc.clicked.connect(self.save_proc_and_spike)
 
+        # Spike analysis window
+        window_layout = QtWidgets.QHBoxLayout()
+        window_layout.addWidget(QtWidgets.QLabel('Pre AP(ms):'))
+        self.spin_window_pre = QtWidgets.QSpinBox()
+        self.spin_window_pre.setRange(0, 500)
+        self.spin_window_pre.setValue(10)
+        window_layout.addWidget(self.spin_window_pre)
+
+        window_layout.addWidget(QtWidgets.QLabel('Post AP(ms):'))
+        self.spin_window_post = QtWidgets.QSpinBox()
+        self.spin_window_post.setRange(0, 500)
+        self.spin_window_post.setValue(20)
+        window_layout.addWidget(self.spin_window_post)
+        left_layout.addLayout(window_layout)
+
         # Batch processing button
         self.btn_batch = QtWidgets.QPushButton('Batch Process')
         left_layout.addWidget(self.btn_batch)
@@ -276,12 +292,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.btn_align = QtWidgets.QPushButton("Zero Baseline")
         self.btn_detect = QtWidgets.QPushButton('Spike Detect')
         self.btn_filter = QtWidgets.QPushButton('Filter Spikes')
+        self.btn_ap_analysis = QtWidgets.QPushButton('AP Analysis')
 
         op_layout.addWidget(self.btn_smooth)
         op_layout.addWidget(self.btn_align)
         op_layout.addWidget(self.btn_detect)
         op_layout.addWidget(self.btn_filter)
-
+        op_layout.addWidget(self.btn_ap_analysis)
         right_layout.addLayout(op_layout)
         splitter.addWidget(right_panel)
         splitter.addWidget(left_panel)
@@ -302,7 +319,9 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.btn_align.clicked.connect(self.apply_zero_baseline)
         self.btn_detect.clicked.connect(self.apply_detect)
         self.btn_filter.clicked.connect(self.apply_filter)
+        self.btn_ap_analysis.clicked.connect(self.apanalysis)
         self.chk_manual_spike.stateChanged.connect(self.update_spike_mode_link)
+    
 
 # Methods
     #load file
@@ -1451,6 +1470,154 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             y = raw_signal.magnitude[:, 0].flatten()
 
             self.raw_plot.plot(t, y, pen=pg.mkPen('k'))
+
+    #AP
+    def apanalysis(self):
+        """Analyze and export spike features with corrected units and stable rise/decay time extraction, and save both relative and absolute spike times."""
+
+        import pandas as pd
+        from scipy.signal import find_peaks, peak_widths
+
+        selected_items = self.file_tree.selectedItems()
+        if not selected_items:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected for AP analysis.")
+            return
+
+        if self.last_folder:
+            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder to Save CSV Files", self.last_folder)
+        else:
+            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder to Save CSV Files")
+        if not folder:
+            return
+
+        self.last_folder = folder
+
+        window_pre_ms = self.spin_window_pre.value()
+        window_post_ms = self.spin_window_post.value()
+
+        results_by_file = {}
+
+        for item in selected_items:
+            key = item.data(0, QtCore.Qt.UserRole)
+            signal = self.signals.get(key, None)
+            if signal is None:
+                continue
+
+            signal_y = signal.magnitude.flatten()
+            fs = float(signal.sampling_rate.rescale('Hz'))
+            dt = 1.0 / fs
+            t_rel = (signal.times - signal.t_start).rescale('s').magnitude.flatten()
+            t_abs = signal.times.rescale('s').magnitude.flatten()
+
+            info = self.get_spike_info(key=key)
+            if info is None:
+                continue
+
+            spike_times = []
+            if info.get('manual_times'):
+                spike_times.extend(info['manual_times'])
+            if info.get('auto_times') is not None:
+                spike_times.extend(info['auto_times'])
+
+            if len(spike_times) == 0:
+                continue
+
+            spike_times = np.sort(np.array(spike_times))
+
+            if 'zeroed' in key.lower():
+                baseline = extract_baseline_value(signal_y, method='mode')
+            else:
+                baseline = 0.0
+
+            features = {
+                'Spike Relative Time (ms)': [],
+                'Spike Absolute Time (ms)': [],
+                'Width (ms)': [],
+                'Amplitude (mV)': [],
+                'Prominence (mV)': [],
+                'Rise Time (ms)': [],
+                'Decay Time (ms)': [],
+                'ISI (ms)': []
+            }
+
+            last_spike_time_abs = None
+
+            for spk_time in spike_times:
+                idx_center = np.argmin(np.abs(t_rel - spk_time))
+
+                idx_start = max(0, idx_center - int(window_pre_ms/1000/dt))
+                idx_end = min(len(signal_y), idx_center + int(window_post_ms/1000/dt))
+
+                ep_y = signal_y[idx_start:idx_end]
+                ep_t = t_rel[idx_start:idx_end] - t_rel[idx_center]
+
+                if len(ep_y) == 0:
+                    continue
+
+                peaks, properties = find_peaks(ep_y, prominence=0)
+                if len(peaks) == 0:
+                    continue
+
+                peak_idx = peaks[np.argmax(ep_y[peaks])]
+                amp = ep_y[peak_idx] + baseline
+                prominence = properties['prominences'][np.argmax(ep_y[peaks])]
+                width = peak_widths(ep_y, [peak_idx], rel_height=0.5)[0][0] * dt * 1000
+
+                half_amp = ep_y[peak_idx] / 2.0
+
+                left_part = ep_y[:peak_idx]
+                rise_candidates = np.where(left_part <= half_amp)[0]
+                if len(rise_candidates) > 0:
+                    rise_time = (peak_idx - rise_candidates[-1]) * dt * 1000
+                else:
+                    rise_time = np.nan
+
+                right_part = ep_y[peak_idx:]
+                decay_candidates = np.where(right_part <= half_amp)[0]
+                if len(decay_candidates) > 0:
+                    decay_time = decay_candidates[0] * dt * 1000
+                else:
+                    decay_time = np.nan
+
+                features['Spike Relative Time (ms)'].append(t_rel[idx_center] * 1000)
+                features['Spike Absolute Time (ms)'].append(t_abs[idx_center] * 1000)
+                features['Width (ms)'].append(width)
+                features['Amplitude (mV)'].append(amp)
+                features['Prominence (mV)'].append(prominence)
+                features['Rise Time (ms)'].append(rise_time)
+                features['Decay Time (ms)'].append(decay_time)
+
+                if last_spike_time_abs is None:
+                    features['ISI (ms)'].append(np.nan)
+                else:
+                    features['ISI (ms)'].append((t_abs[idx_center] - last_spike_time_abs) * 1000)
+
+                last_spike_time_abs = t_abs[idx_center]
+
+            if not features['Spike Relative Time (ms)']:
+                continue
+
+            base_name = key.split('_sweep')[0]
+
+            if base_name not in results_by_file:
+                results_by_file[base_name] = []
+
+            results_by_file[base_name].append(features)
+
+        for base_name, features_list in results_by_file.items():
+            combined = {k: [] for k in features_list[0].keys()}
+
+            for feat in features_list:
+                for k, v in feat.items():
+                    combined[k].extend(v)
+
+            df = pd.DataFrame(combined).transpose()
+            df.columns = [f"Spike{i+1}" for i in range(df.shape[1])]
+
+            save_path = os.path.join(folder, f"{base_name}_apanalysis.csv")
+            df.to_csv(save_path, header=True)
+
+        QtWidgets.QMessageBox.information(self, "Export Done", "AP Analysis completed!")
 
     def batch_process(self):
         QtWidgets.QMessageBox.information(self, "Batch", "Batch processing not implemented yet.")
