@@ -44,8 +44,9 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.proc_plot.addItem(self.manual_spike_scatter)
 
         # Hover marker
-        self.hover_marker = pg.ScatterPlotItem(size=10, brush=pg.mkBrush(255, 0, 0, 100))
+        self.hover_marker = pg.ScatterPlotItem(size=10, brush=pg.mkBrush(0, 200, 0, 150))
         self.hover_marker.setVisible(False)
+        self.hover_marker.setZValue(1000)
         self.proc_plot.addItem(self.hover_marker)
 
         # Redo manual mark
@@ -1017,6 +1018,20 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         plot.mousePressEvent = lambda e: self.handle_mouse_event(e, plot)
         plot.mouseReleaseEvent = lambda e: self.handle_mouse_release(e, plot)
 
+        if plot == self.proc_plot:
+            plot.scene().sigMouseMoved.connect(self.proc_plot_mouse_moved)
+
+    def proc_plot_mouse_moved(self, pos):
+        if self.proc_plot.plotItem.vb.sceneBoundingRect().contains(pos):
+            mouse_point = self.proc_plot.plotItem.vb.mapSceneToView(pos)
+            x = mouse_point.x()
+            y = mouse_point.y()
+
+            if self.chk_manual_spike.isChecked():
+                self.update_hover_marker(x, y)
+            else:
+                self.hover_marker.setVisible(False)
+
     def handle_mouse_event(self, event, plot):
         if self.chk_manual_spike.isChecked() and plot == self.proc_plot:
             self.handle_manual_spike_click(event)
@@ -1133,35 +1148,8 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.update_manual_spike_scatter()
 
         elif event.button() == Qt.RightButton:
+            # delete spike (auto or manual)
             self.delete_nearest_spike(click_x, click_y)
-
-    def delete_nearest_manual_spike(self, click_x, click_y):
-        """Delete the nearest manually marked spike."""
-        if self.proc_key not in self.spike_info:
-            return
-
-        info = self.spike_info[self.proc_key]
-        manual_times = info.get('manual_times', [])
-        manual_amps = info.get('manual_amps', [])
-
-        if not manual_times:
-            return
-
-        distances = np.sqrt((np.array(manual_times) - click_x) ** 2 + (np.array(manual_amps) - click_y) ** 2)
-        min_idx = np.argmin(distances)
-
-        pixel_scale_x = (self.proc_plot.plotItem.vb.viewRange()[0][1] - self.proc_plot.plotItem.vb.viewRange()[0][0]) / self.proc_plot.width()
-        pixel_scale_y = (self.proc_plot.plotItem.vb.viewRange()[1][1] - self.proc_plot.plotItem.vb.viewRange()[1][0]) / self.proc_plot.height()
-        pixel_radius = np.sqrt((20 * pixel_scale_x) ** 2 + (20 * pixel_scale_y) ** 2)
-
-        if distances[min_idx] > pixel_radius:
-            return 
-
-        # delete
-        del manual_times[min_idx]
-        del manual_amps[min_idx]
-
-        self.update_manual_spike_scatter()
 
     def undo_manual_spike(self):
         """Undo the last manually added spike."""
@@ -1267,41 +1255,26 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Detection Error", f"Spike detection failed:\n{e}")
 
-    def plot_detected_spikes(self):
-        """Plot current processed signal with auto and manual spikes."""
-        
-        if self.proc_signal is None:
+    def handle_manual_spike_click(self, event):
+        """Handle left click to add manual spike, right click to delete nearest spike."""
+        if event.button() not in (Qt.LeftButton, Qt.RightButton):
             return
 
-        self.clear_proc_plot()
+        if self.proc_signal is None or self.hover_spike is None:
+            return
 
-        signal = self.proc_signal
-        t = self.get_relative_time(signal, signal.times.rescale('s').magnitude, mode='time')
-        y = signal.magnitude.flatten()
+        click_x, click_y = self.hover_spike
 
-        self.proc_plot.plot(t, y, pen=pg.mkPen('b'))
+        if event.button() == Qt.LeftButton:
+            # add spike
+            info = self.get_spike_info(create=True)
+            info['manual_times'].append(click_x)
+            info['manual_amps'].append(click_y)
+            self.update_manual_spike_scatter()
 
-        info = self.spike_info.get(self.proc_key, {})
-
-        auto_times = info.get('auto_times', None)
-        auto_amps = info.get('auto_amps', None)
-
-        if auto_times is not None and len(auto_times) > 0:
-            self.proc_plot.plot(
-                auto_times, auto_amps,
-                pen=None, symbol='o', symbolBrush='r', symbolSize=6, name="Auto Spikes"
-            )
-
-        manual_times = info.get('manual_times', None)
-        manual_amps = info.get('manual_amps', None)
-
-        if manual_times is not None and len(manual_times) > 0:
-            self.proc_plot.plot(
-                manual_times, manual_amps,
-                pen=None, symbol='x', symbolBrush='g', symbolSize=8, name="Manual Spikes"
-            )
-
-        self.reset_view()
+        elif event.button() == Qt.RightButton:
+            # delete spike
+            self.delete_nearest_spike(click_x, click_y)
 
     def apply_filter(self):
         """Apply amplitude and clustering filter to detected spikes for the current signal."""
@@ -1330,6 +1303,35 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         self.update_auto_spikes(filtered_times, filtered_amps)
         self.plot_detected_spikes()
+
+    def plot_detected_spikes(self):
+        """Plot processed signal with auto spikes; manual spikes handled separately."""
+        if self.proc_signal is None:
+            return
+
+        self.clear_proc_plot()
+
+        signal = self.proc_signal
+        t = self.get_relative_time(signal, signal.times.rescale('s').magnitude, mode='time')
+        y = signal.magnitude.flatten()
+
+        self.proc_plot.plot(t, y, pen=pg.mkPen('b'))
+
+        info = self.spike_info.get(self.proc_key, {})
+
+        auto_times = info.get('auto_times', None)
+        auto_amps = info.get('auto_amps', None)
+
+        if auto_times is not None and len(auto_times) > 0:
+            self.proc_plot.plot(
+                auto_times, auto_amps,
+                pen=None, symbol='o', symbolBrush='r', symbolSize=6, name="Auto Spikes"
+            )
+
+        # send to manual_spike_scatter
+        self.update_manual_spike_scatter()
+
+        self.reset_view()
 
     def get_relative_time(self, signal, indices_or_times, mode='index'):
         """Convert index or time array into relative time"""
@@ -1394,7 +1396,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.manual_spike_scatter.setData(spots)
 
     def delete_nearest_spike(self, click_x, click_y):
-        """Delete the nearest spike (auto or manual) under cursor."""
+        """Delete the nearest spike (auto or manual) under cursor if close enough."""
         info = self.get_spike_info()
         if info is None:
             return
@@ -1413,9 +1415,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         distances = np.sqrt((all_times - click_x) ** 2 + (all_amps - click_y) ** 2)
         min_idx = np.argmin(distances)
 
-        # auto or manual 
+        # max distance
+        max_distance = 0.15  
+        if distances[min_idx] > max_distance:
+            return
+
+        # auto or manual
         if min_idx < len(auto_times):
-            # delete auto spike
             info['auto_times'] = np.delete(auto_times, min_idx)
             info['auto_amps'] = np.delete(auto_amps, min_idx)
         else:
