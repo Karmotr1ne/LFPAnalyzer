@@ -6,11 +6,11 @@ import h5py
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
+import pyquery as pq
 from neo.io import NixIO
 from PyQt5 import QtWidgets,QtCore,QtGui
 from PyQt5.QtCore import QSettings, QDir, Qt
 from functools import partial
-from scipy import sparse
 from scipy.sparse.linalg import spsolve
 
 class LFPAnalyzer(QtWidgets.QMainWindow):
@@ -228,15 +228,15 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.chk_manual_spike.setChecked(False)
         self.chk_show_raw = QtWidgets.QCheckBox("Show Origin")
         self.chk_show_raw.setChecked(False)
-        self.btn_save_proc = QtWidgets.QPushButton('Save Spike')
+        self.btn_clear_spikes = QtWidgets.QPushButton('Clear Spikes')
         manual_layout.addWidget(self.chk_manual_spike)
         manual_layout.addWidget(self.chk_show_raw)
-        manual_layout.addWidget(self.btn_save_proc)
+        manual_layout.addWidget(self.btn_clear_spikes)
 
         left_layout.addLayout(manual_layout)
         
         self.chk_show_raw.stateChanged.connect(self.update_show_raw)
-        self.btn_save_proc.clicked.connect(self.save_proc_and_spike)
+        self.btn_clear_spikes.clicked.connect(self.clear_spikes)
 
         # Spike analysis window
         window_layout = QtWidgets.QHBoxLayout()
@@ -259,9 +259,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         self.btn_batch_preprocess = QtWidgets.QPushButton('Preprocess All')
         batch_layout.addWidget(self.btn_batch_preprocess)
-
-        self.btn_batch_extract = QtWidgets.QPushButton('Extract All Peaks')
-        batch_layout.addWidget(self.btn_batch_extract)
 
         # processing
         self.batch_progress_bar = QtWidgets.QProgressBar()
@@ -340,7 +337,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.btn_save.clicked.connect(self.save)
         self.btn_apply.clicked.connect(self.apply_downsample)
         self.btn_batch_preprocess.clicked.connect(self.batch_preprocess)
-        self.btn_batch_extract.clicked.connect(self.batch_extract_peaks)
         self.btn_smooth.clicked.connect(self.apply_smooth)
         self.btn_align.clicked.connect(self.apply_zero_baseline)
         self.btn_detect.clicked.connect(self.apply_detect)
@@ -352,7 +348,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 # Methods
     #load file
     def load_single_file(self, path):
-        """Load a single .abf or .h5 file into signals, raw_signals, and file tree."""
+        """Load a .abf or .h5 file, including raw, processed signals, and spike events."""
         from copy import deepcopy
         import neo
 
@@ -363,9 +359,8 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             if ext == '.abf':
                 reader = neo.io.AxonIO(filename=path)
                 block = reader.read_block(lazy=False)
-                reader = None
             elif ext == '.h5':
-                reader = neo.io.NixIO(filename=path, mode='ro')
+                reader = NixIO(filename=path, mode='ro')
                 block = reader.read_block(lazy=False)
                 if not hasattr(self, 'h5_readers'):
                     self.h5_readers = {}
@@ -373,42 +368,50 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             else:
                 QtWidgets.QMessageBox.warning(self, "Warning", f"Unsupported file type: {ext}")
                 return
-
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load Error", f"Failed to load {path}\n{e}")
             return
 
         try:
             for i, seg in enumerate(block.segments):
-                if not seg.analogsignals:
+                raw_sig = None
+                proc_sig = None
+
+                for sig in seg.analogsignals:
+                    if sig.name == "raw":
+                        raw_sig = deepcopy(sig)
+                    elif sig.name == "processed":
+                        proc_sig = deepcopy(sig)
+
+                if proc_sig is None and seg.analogsignals:
+                    proc_sig = deepcopy(seg.analogsignals[0])
+                    print(f"[Warning] No 'processed' signal found, using the first available signal for {base_name} sweep {i}.")
+
+                if proc_sig is None:
                     continue
 
-                signal = seg.analogsignals[0]
+                display_name = self._generate_unique_name(f"{base_name}_sweep{i}")
 
-                raw_copy = deepcopy(signal)
-                proc_copy = deepcopy(signal)
-
-                display_name = self._generate_unique_name(f"{base_name}_sweep{i+1}")
-
-                self.raw_signals[display_name] = raw_copy
-                self.signals[display_name] = proc_copy
+                self.signals[display_name] = proc_sig
                 self.path_map[display_name] = path
                 self.loaded_paths.add(path)
 
+                if raw_sig is not None:
+                    self.raw_signals[display_name] = raw_sig
+                else:
+                    self.raw_signals[display_name] = proc_sig  # fallback
+
+                # Add item to file tree
                 item = QtWidgets.QTreeWidgetItem([display_name])
                 item.setData(0, QtCore.Qt.UserRole, display_name)
                 self.file_tree.addTopLevelItem(item)
 
-                # get spike
-                if ext == '.h5':
-                    self.load_spikes_from_h5(path, display_name)
-
-                # load and plot
+                # Set current view if empty
                 if self.current_key is None:
                     self.current_key = display_name
                     self.proc_key = display_name
-                    self.proc_signal = proc_copy
-                    self.raw_signal = raw_copy
+                    self.proc_signal = self.signals[display_name]
+                    self.raw_signal = self.raw_signals.get(display_name)
                     self.file_tree.setCurrentItem(item)
                     self.on_tree_item_clicked(item, 0)
 
@@ -435,36 +438,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         except Exception:
             pass
         return False
-
-    def load_spikes_from_h5(self, path, key):
-        """Load saved spike info for a signal, only if available."""
-        import h5py
-        try:
-            with h5py.File(path, 'r') as f:
-                if 'spikes' not in f:
-                    return 
-
-                grp_spikes = f['spikes']
-
-                has_auto = 'auto' in grp_spikes and 'times' in grp_spikes['auto'] and 'amplitudes' in grp_spikes['auto']
-                has_manual = 'manual' in grp_spikes and 'times' in grp_spikes['manual'] and 'amplitudes' in grp_spikes['manual']
-
-                if not (has_auto or has_manual):
-                    return 
-
-                # if with spikes, new
-                self.spike_info[key] = {}
-
-                if has_auto:
-                    self.spike_info[key]['auto_times'] = grp_spikes['auto']['times'][:]
-                    self.spike_info[key]['auto_amps'] = grp_spikes['auto']['amplitudes'][:]
-
-                if has_manual:
-                    self.spike_info[key]['manual_times'] = grp_spikes['manual']['times'][:].tolist()
-                    self.spike_info[key]['manual_amps'] = grp_spikes['manual']['amplitudes'][:].tolist()
-
-        except Exception as e:
-            print(f"Warning: Failed to load spikes from {path}: {e}")
 
     def load_file(self):
         """Let user select and load multiple .abf or .h5 files."""
@@ -563,48 +536,23 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.show_info("All selected signals saved successfully.", title="Success")
 
     def _save_signal_to_h5(self, signal, out_path, key):
-        # clear
+        from neo import Block, Segment
+        from neo.io import NixIO
+
         if os.path.exists(out_path):
             os.remove(out_path)
 
-        blk = neo.Block(name=f"block_{key}")
-        seg = neo.Segment(name=f"seg_{key}")
+        blk = Block(name=f"block_{key}")
+        seg = Segment(name=f"seg_{key}")
+
         signal.name = f"sig_{key}"
         seg.analogsignals.append(signal)
         blk.segments.append(seg)
+
+        # signal
         with NixIO(filename=out_path, mode='ow') as io:
             io.write_block(blk)
 
-        info = self.spike_info.get(key, None)
-        if info is None:
-            return
-
-        auto_times  = info.get('auto_times',  None)
-        auto_amps   = info.get('auto_amps',   None)
-        manual_times = info.get('manual_times', [])
-        manual_amps  = info.get('manual_amps',  [])
-
-        has_auto   = (auto_times is not None and getattr(auto_times, 'size', len(auto_times)) > 0)
-        has_manual = (len(manual_times) > 0)
-
-        if not (has_auto or has_manual):
-            return
-
-        with h5py.File(out_path, 'a') as f:
-            if 'spikes' in f:
-                del f['spikes']
-            grp_spikes = f.create_group('spikes')
-
-            if has_auto:
-                g_auto = grp_spikes.create_group('auto')
-                g_auto.create_dataset('times',      data=auto_times)
-                g_auto.create_dataset('amplitudes', data=auto_amps)
-
-            if has_manual:
-                g_man = grp_spikes.create_group('manual')
-                g_man.create_dataset('times',      data=manual_times)
-                g_man.create_dataset('amplitudes', data=manual_amps)
-   
     #remove
     def remove_file(self):
         """Remove selected signals from the view and memory."""
@@ -767,40 +715,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.clear_and_reload()
         elif action == overlay_action:
             self.overlay_selected_signals()
-    #add new
-    def _add_signal_to_tree(self, display_name, signal):
-        self.signals[display_name] = signal
-        item = QtWidgets.QTreeWidgetItem([display_name])
-        item.setData(0, QtCore.Qt.UserRole, display_name)
-        self.file_tree.addTopLevelItem(item)
-    def save_proc_and_spike(self):
-        """Save current processed signal and spike into tree view (internal save)."""
-        if self.proc_signal is None:
-            QtWidgets.QMessageBox.warning(self, "Warning", "No processed signal to save.")
-            return
-
-        from copy import deepcopy
-
-        new_signal = deepcopy(self.proc_signal)
-        new_key = self._generate_unique_name(f"{self.proc_key}_saved")
-
-        self.signals[new_key] = new_signal
-
-        # get source_map
-        self.source_map[new_key] = self.proc_key
-
-        if self.proc_key in self.spike_info:
-            self.spike_info[new_key] = deepcopy(self.spike_info[self.proc_key])
-
-        if self.proc_key in self.raw_signals:
-            self.raw_signals[new_key] = deepcopy(self.raw_signals[self.proc_key])
-
-        if self.proc_key in self.path_map:
-            self.path_map[new_key] = self.path_map[self.proc_key]
-
-        item = QtWidgets.QTreeWidgetItem([new_key])
-        item.setData(0, QtCore.Qt.UserRole, new_key)
-        self.file_tree.addTopLevelItem(item)
 
     #clear&reload
     def clear_and_reload(self):
@@ -835,6 +749,22 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         if hasattr(self, "manual_spike_scatter") and self.manual_spike_scatter is not None:
             self.proc_plot.addItem(self.manual_spike_scatter)
+    def clear_spikes(self):
+        """Clear all spikes for the current signal."""
+        if self.proc_key not in self.spike_info:
+            self.show_info("No spikes to clear.", title="Info")
+            return
+
+        info = self.spike_info[self.proc_key]
+        info['auto_times'] = None
+        info['auto_amps'] = None
+        info['manual_times'] = []
+        info['manual_amps'] = []
+
+        self.update_manual_spike_scatter()
+        self.plot_detected_spikes()
+
+        self.show_info("Spikes cleared.", title="Done")
 
     #overlay
     def overlay_selected_signals(self):
@@ -1377,7 +1307,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             return
 
         t = self.get_relative_time(self.proc_signal, self.proc_signal.times.rescale('s').magnitude, mode='time')
-        ydata = self.proc_signal.magnitude.flatten()
+        ydata = self.proc_signal.magnitude[:, 0]
 
         pixel_scale_x = (self.proc_plot.plotItem.vb.viewRange()[0][1] - self.proc_plot.plotItem.vb.viewRange()[0][0]) / self.proc_plot.width()
         pixel_scale_y = (self.proc_plot.plotItem.vb.viewRange()[1][1] - self.proc_plot.plotItem.vb.viewRange()[1][0]) / self.proc_plot.height()
@@ -1436,7 +1366,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         min_idx = np.argmin(distances)
 
         # max distance
-        max_distance = 0.15  
+        max_distance = 0.5  
         if distances[min_idx] > max_distance:
             return
 
@@ -1452,25 +1382,68 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.plot_detected_spikes()
 
     def update_show_raw(self):
-        """Show or hide original saved raw signal."""
+        """Show or hide the original raw signal associated with the current key."""
         self.raw_plot.clear()
 
-        if self.chk_show_raw.isChecked() and self.current_key is not None:
-            # find
-            raw_signal = self.raw_signals.get(self.current_key)
+        if not self.chk_show_raw.isChecked() or self.current_key is None:
+            return
 
-            if raw_signal is None:
-                # move suffix
-                base_key = self.current_key.split("_saved")[0]
-                raw_signal = self.raw_signals.get(base_key)
+        # get raw
+        base_key = self.current_key
+        while base_key in self.source_map:
+            base_key = self.source_map[base_key]
 
-            if raw_signal is None:
-                return
+        # remove version: "_v1" "_v2"
+        base_key = base_key.split('_v')[0]
 
+        raw_signal = self.raw_signals.get(base_key)
+
+        if raw_signal is not None:
             t = (raw_signal.times - raw_signal.t_start).rescale('s').magnitude.flatten()
-            y = raw_signal.magnitude[:, 0].flatten()
-
+            y = raw_signal.magnitude.flatten()
             self.raw_plot.plot(t, y, pen=pg.mkPen('k'))
+            self.reset_raw_view()
+            return
+
+        # 找不到原始数据
+        QtWidgets.QMessageBox.warning(
+            self, "Missing Raw Data",
+            f"Original raw signal for '{self.current_key}' not found."
+        )
+
+    def update_raw_plot(self):
+        """Redraw the raw signal and spike points."""
+        self.raw_plot.clear()
+
+        if self.raw_signal is None:
+            return
+
+        t = (self.raw_signal.times - self.raw_signal.t_start).rescale('s').magnitude.flatten()
+        y = self.raw_signal.magnitude.flatten()
+
+        self.raw_plot.plot(t, y, pen=pg.mkPen('k'))
+
+        if self.chk_show_spikes.isChecked() and self.current_key:
+            self.plot_spike_times(self.raw_plot, self.current_key)
+
+        self.reset_raw_view()
+
+    def update_proc_plot(self):
+        """Redraw the processed signal and spike points."""
+        self.proc_plot.clear()
+
+        if self.proc_signal is None:
+            return
+
+        t = (self.proc_signal.times - self.proc_signal.t_start).rescale('s').magnitude.flatten()
+        y = self.proc_signal.magnitude[:, 0]
+
+        self.proc_plot.plot(t, y, pen=pg.mkPen('b'))
+
+        if self.chk_show_spikes.isChecked() and self.current_key:
+            self.plot_spike_times(self.proc_plot, self.current_key)
+
+        self.reset_proc_view()
 
     #AP
     def apanalysis(self):
@@ -1620,57 +1593,17 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "Export Done", "AP Analysis completed!")
 
     #batch
-    def batch_extract_peaks(self):
-        """Extract peaks from batch processed h5 files and save as CSV."""
-        input_folder = self.select_folder("Select Input Folder for Peak Extraction")
-        if not input_folder:
-            return
-
-        output_folder = self.select_folder("Select Output Folder for Saving Extracted Peaks")
-        if not output_folder:
-            return
-
-        self.last_extract_input_folder = input_folder
-        self.last_extract_output_folder = output_folder
-
-        file_list = self.get_all_files(input_folder, suffixes=('.h5',))
-        if not file_list:
-            self.show_warning("No .h5 files found.")
-            return
-
-        def extract_single_file(filepath):
-            import h5py
-            import pandas as pd
-
-            rel_path = os.path.relpath(filepath, input_folder)
-            save_path = os.path.join(output_folder, rel_path).replace('.h5', '_peaks.csv')
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-            with h5py.File(filepath, 'r') as f:
-                if 'peaks' not in f:
-                    raise ValueError("No 'peaks' group found.")
-
-                peaks_grp = f['peaks']
-                features = {key: peaks_grp[key][()] for key in peaks_grp.keys()}
-                if not features:
-                    raise ValueError("Empty peaks.")
-
-                df = pd.DataFrame(features).transpose()
-                df.columns = [f"Spike{i+1}" for i in range(df.shape[1])]
-                df.to_csv(save_path)
-
-        success, failed = self.run_batch_processing(file_list, extract_single_file, title="Batch Peak Extraction...")
-
-        summary = f"Success: {len(success)} files\nFailed: {len(failed)} files"
-        self.show_info(summary, title="Batch Peak Extraction Done")
-
     def batch_preprocess(self):
-        """Batch downsampling + ALS baseline + spike detection."""
+        """Batch preprocess all sweeps and save as fully standard NIX format."""
+        import quantities as pq
+        from neo import Block, Segment, AnalogSignal, Event
+        import neo
+
         input_folder = self.select_folder("Select Input Folder for Batch Preprocessing")
         if not input_folder:
             return
 
-        output_folder = self.select_folder("Select Output Folder for Saving Processed Data")
+        output_folder = self.select_folder("Select Output Folder to Save Processed Data")
         if not output_folder:
             return
 
@@ -1682,81 +1615,136 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.show_warning("No .abf or .h5 files found.")
             return
 
-        def preprocess_single_file(filepath):
+        self.create_progress_dialog("Batch Preprocessing...", len(file_list))
 
-            rel_path = os.path.relpath(filepath, input_folder)
-            save_path = os.path.join(output_folder, rel_path).replace('.abf', '.h5')
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        success, failed = [], []
 
-            segment = None
+        for idx, filepath in enumerate(file_list):
+            try:
+                rel_path = os.path.relpath(filepath, input_folder)
+                save_path = os.path.join(output_folder, rel_path).replace('.abf', '.h5')
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-            if filepath.endswith(".abf"):
-                reader = neo.io.AxonIO(filepath)
-                block = reader.read_block()
-                segment = block.segments[0]
-            elif filepath.endswith(".h5"):
-                if self.is_nix_file(filepath):
-                    reader = neo.io.NixIO(filepath, mode='ro')
+                if os.path.exists(save_path):
+                    reply = QtWidgets.QMessageBox.question(
+                        self,
+                        "Overwrite Confirmation",
+                        f"File already exists:\n{save_path}\n\nDo you want to overwrite it?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No
+                    )
+                    if reply == QtWidgets.QMessageBox.No:
+                        continue
+
+                ext = os.path.splitext(filepath)[1].lower()
+                if ext == '.abf':
+                    reader = neo.io.AxonIO(filepath)
                     block = reader.read_block()
-                    segment = block.segments[0]
+                elif ext == '.h5':
+                    if self.is_nix_file(filepath):
+                        reader = NixIO(filepath, mode='ro')
+                        block = reader.read_block()
+                    else:
+                        raise ValueError(f"Non-NIX h5 file skipped: {filepath}")
                 else:
-                    print(f"Skipping non-NIX h5 file: {filepath}")
-                    return
+                    raise ValueError(f"Unsupported file extension: {filepath}")
 
-            if segment is None or not segment.analogsignals:
-                raise ValueError("No valid analog signals.")
+                if block is None or not block.segments:
+                    raise ValueError(f"No valid segments found in {filepath}")
 
-            peaks_info = self.preprocess_segment(segment)
-            if peaks_info is None:
-                raise ValueError("Failed to preprocess segment.")
+                new_block = Block(name=f"block_{os.path.basename(filepath)}")
 
-            with h5py.File(save_path, 'w') as f:
-                grp = f.create_group('peaks')
-                for key, value in peaks_info.items():
-                    grp.create_dataset(key, data=value)
+                for i, segment in enumerate(block.segments):
+                    if not segment.analogsignals:
+                        continue
 
-        success, failed = self.run_batch_processing(file_list, preprocess_single_file, title="Batch Preprocessing...")
+                    signal = segment.analogsignals[0]
+                    y = signal.magnitude.flatten()
+                    t = (signal.times - signal.t_start).rescale('s').magnitude.flatten()
+                    sampling_rate = float(signal.sampling_rate.rescale('Hz'))
 
-        summary = f"Success: {len(success)} files\nFailed: {len(failed)} files"
+                    raw_signal = AnalogSignal(
+                        y.reshape(-1, 1),
+                        units=signal.units,
+                        sampling_rate=sampling_rate * pq.Hz,
+                        t_start=0 * pq.s,
+                        name="raw"
+                    )
+
+                    factor = self.spin_down.value()
+                    if factor <= 0:
+                        factor = 1
+
+                    y_ds = y[::factor]
+                    t_ds = t[::factor]
+
+                    lam = self.base_lambda * (10 ** self.spin_sigma_lambda.value())
+                    p = self.base_p * (10 ** self.spin_sigma_p.value())
+                    baseline = als_baseline(y_ds, lam=lam, p=p)
+                    detrended = y_ds - baseline
+
+                    downsampled_sampling_rate = sampling_rate / factor
+
+                    processed_signal = AnalogSignal(
+                        detrended.reshape(-1, 1),
+                        units=signal.units,
+                        sampling_rate=downsampled_sampling_rate * pq.Hz,
+                        t_start=0 * pq.s,
+                        name="processed"
+                    )
+
+                    new_segment = Segment(name=f"sweep{i}")
+                    new_segment.analogsignals.append(raw_signal)
+                    new_segment.analogsignals.append(processed_signal)
+
+                    new_block.segments.append(new_segment)
+
+                with NixIO(filename=save_path, mode='ow') as writer:
+                    writer.write_block(new_block)
+
+                success.append(filepath)
+
+            except Exception as e:
+                print(f"Error processing {filepath}: {e}")
+                failed.append(filepath)
+
+            self.update_progress(idx + 1)
+
+        self.batch_progress_bar.setVisible(False)
+
+        summary = f"Batch Preprocessing Finished.\n\nSuccess: {len(success)} files\nFailed: {len(failed)} files"
+        if failed:
+            summary += "\n\nFailed files:\n" + "\n".join(os.path.basename(f) for f in failed)
         self.show_info(summary, title="Batch Preprocessing Done")
 
     def preprocess_segment(self, segment):
-        """Apply downsample, ALS, find peaks, return peak info dict"""
-
-        if not segment.analogsignals:
-            return None
+        """Preprocess a segment: downsampling and ALS baseline correction."""
+        if segment is None or not segment.analogsignals:
+            raise ValueError("Segment is empty or missing analog signals.")
 
         signal = segment.analogsignals[0]
         y = signal.magnitude.flatten()
         t = (signal.times - signal.t_start).rescale('s').magnitude.flatten()
 
-        # Downsample
-        factor = self.spin_down.value() if hasattr(self, 'spin_down') else 20
+        # Downsampling
+        factor = self.spin_down.value()
+        if factor <= 0:
+            factor = 1
+
         y_ds = y[::factor]
         t_ds = t[::factor]
 
-        # ALS baseline
+        # ALS
         lam = self.base_lambda * (10 ** self.spin_sigma_lambda.value())
         p = self.base_p * (10 ** self.spin_sigma_p.value())
+
         baseline = als_baseline(y_ds, lam=lam, p=p)
         detrended = y_ds - baseline
 
-        # find_peaks
-        from scipy.signal import find_peaks, peak_widths
-        peaks, properties = find_peaks(detrended, prominence=0.02)
+        # spike detect = None
+        peaks_info = None
 
-        if len(peaks) == 0:
-            return None
-
-        widths = peak_widths(detrended, peaks, rel_height=0.5)[0] / signal.sampling_rate.rescale('Hz') * 1000
-
-        # return to diction
-        return {
-            'times': t_ds[peaks] * 1000,  # ms
-            'amplitudes': detrended[peaks],
-            'prominences': properties['prominences'],
-            'widths': widths
-        }
+        return detrended, peaks_info, t, y
 
     def create_progress_dialog(self, title, total_files):
         """new fixed bar"""
@@ -1851,7 +1839,6 @@ def als_baseline(y, lam=1e4, p=1e-4, niter=10):
         w = p * (y > z) + (1 - p) * (y < z)
 
     return z
-
 
 #get baseline height
 def extract_baseline_value(y, method='mode', sample_size=10000):
