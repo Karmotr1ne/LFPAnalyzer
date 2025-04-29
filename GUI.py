@@ -12,6 +12,7 @@ from PyQt5 import QtWidgets,QtCore,QtGui
 from PyQt5.QtCore import QSettings, QDir, Qt
 from functools import partial
 from scipy.sparse.linalg import spsolve
+from scipy.ndimage import uniform_filter1d
 
 class LFPAnalyzer(QtWidgets.QMainWindow):
     def __init__(self):
@@ -160,6 +161,11 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         wavelet_group = QtWidgets.QGroupBox("Wavelet Settings")
         wavelet_form = QtWidgets.QFormLayout()
 
+        #auto range
+        self.btn_recommend_freq = QtWidgets.QPushButton("Auto Recommend Freqency")
+        wavelet_form.addRow(self.btn_recommend_freq)
+        self.btn_recommend_freq.clicked.connect(self.recommend_freq_range)
+
         # mother wavelet
         self.combo_wavelet = QtWidgets.QComboBox()
         self.combo_wavelet.addItems(['morl', 'cmor', 'mexh', 'gaus1'])
@@ -173,7 +179,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.freq_low.setValue(20)
         self.freq_high = QtWidgets.QSpinBox()
         self.freq_high.setRange(1, 2000)
-        self.freq_high.setValue(80)
+        self.freq_high.setValue(250)
         freq_range_layout.addWidget(self.freq_low)
         freq_range_layout.addWidget(QtWidgets.QLabel(" - "))
         freq_range_layout.addWidget(self.freq_high)
@@ -222,7 +228,11 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         filter_group.setLayout(filter_form)
         left_layout.addWidget(filter_group)
 
-        # Manual Spike + Show Raw on same line
+        # Spike analysis controls - GroupBox version
+        spike_group = QtWidgets.QGroupBox("Spike Analysis Settings")
+        spike_layout = QtWidgets.QVBoxLayout()
+
+        # Manual Spike Checkbox + Show Raw + Clear Button
         manual_layout = QtWidgets.QHBoxLayout()
         self.chk_manual_spike = QtWidgets.QCheckBox("Manual Spike")
         self.chk_manual_spike.setChecked(False)
@@ -232,26 +242,27 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         manual_layout.addWidget(self.chk_manual_spike)
         manual_layout.addWidget(self.chk_show_raw)
         manual_layout.addWidget(self.btn_clear_spikes)
+        spike_layout.addLayout(manual_layout)
 
-        left_layout.addLayout(manual_layout)
-        
-        self.chk_show_raw.stateChanged.connect(self.update_show_raw)
-        self.btn_clear_spikes.clicked.connect(self.clear_spikes)
-
-        # Spike analysis window
+        # Spike window settings
         window_layout = QtWidgets.QHBoxLayout()
-        window_layout.addWidget(QtWidgets.QLabel('Pre AP(ms):'))
+        window_layout.addWidget(QtWidgets.QLabel('Pre AP (ms):'))
         self.spin_window_pre = QtWidgets.QSpinBox()
         self.spin_window_pre.setRange(0, 500)
         self.spin_window_pre.setValue(10)
         window_layout.addWidget(self.spin_window_pre)
 
-        window_layout.addWidget(QtWidgets.QLabel('Post AP(ms):'))
+        window_layout.addWidget(QtWidgets.QLabel('Post AP (ms):'))
         self.spin_window_post = QtWidgets.QSpinBox()
         self.spin_window_post.setRange(0, 500)
         self.spin_window_post.setValue(20)
         window_layout.addWidget(self.spin_window_post)
-        left_layout.addLayout(window_layout)
+        spike_layout.addLayout(window_layout)
+
+        # Pack group
+        spike_group.setLayout(spike_layout)
+        left_layout.addWidget(spike_group)
+
 
         # Batch processing button
         batch_group = QtWidgets.QGroupBox("Batch Processing")
@@ -764,8 +775,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.update_manual_spike_scatter()
         self.plot_detected_spikes()
 
-        self.show_info("Spikes cleared.", title="Done")
-
     #overlay
     def overlay_selected_signals(self):
         """Overlay multiple selected signals in raw_plot, with clickable legend toggle."""
@@ -1170,6 +1179,43 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.proc_plot.setXLink(self.raw_plot)  
         else:
             self.proc_plot.setXLink(None)            
+
+    def recommend_freq_range(self):
+        if self.proc_signal is None:
+            QtWidgets.QMessageBox.warning(self, "Warning", "No processed signal available.")
+            return
+
+        y = self.proc_signal.magnitude.flatten()
+        fs = float(self.proc_signal.sampling_rate.rescale('Hz').magnitude)
+
+        from scipy.signal import find_peaks
+
+        # threshold peak
+        peaks, _ = find_peaks(y, prominence=np.std(y))
+        if len(peaks) < 2:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Not enough peaks to estimate.")
+            return
+
+        # average spike width
+        widths = np.diff(peaks) / fs  # interval
+        typical_width = np.median(widths)
+        if typical_width <= 0:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Width estimation failed.")
+            return
+
+        # range
+        f_center = 1.0 / typical_width
+        f_low = max(1, int(f_center / 2))
+        f_high = min(int(f_center * 2), int(fs / 2)) 
+        self.freq_low.setValue(f_low)
+        self.freq_high.setValue(f_high)
+
+        QtWidgets.QMessageBox.information(
+            self, "Recommended Frequency Range",
+            f"Estimated spike width: {typical_width*1000:.1f} ms\n"
+            f"Recommended frequency range: {f_low}–{f_high} Hz"
+        )
+
 
     def apply_detect(self):
         if self.proc_key is None or self.proc_key not in self.signals:
@@ -1892,16 +1938,21 @@ def wavelet_spike_detect(signal, fs, freq_range=(80, 250), threshold_std=3, wave
         scales = np.arange(1, 128)
 
     coeffs, freqs = pywt.cwt(signal, scales, wavelet, sampling_period=1/fs)
-
     band_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
     if not np.any(band_mask):
         return np.array([], dtype=int)
 
     band_energy = np.abs(coeffs[band_mask, :]).mean(axis=0)
+    
+    window_size = int(fs * 0.5)
+    if window_size < 10:
+        window_size = 10
 
-    mean_val = np.mean(band_energy)
-    std_val = np.std(band_energy)
-    spike_idx = np.where(band_energy > mean_val + threshold_std * std_val)[0]
+    local_mean = uniform_filter1d(band_energy, size=window_size)
+    residual = band_energy - local_mean
+    local_std = np.std(residual)
+
+    spike_idx = np.where(residual > threshold_std * local_std)[0]
     return spike_idx
 
 #cluster
