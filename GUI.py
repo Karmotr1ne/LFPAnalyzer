@@ -353,6 +353,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.btn_detect.clicked.connect(self.apply_detect)
         self.btn_filter.clicked.connect(self.apply_filter)
         self.btn_ap_analysis.clicked.connect(self.apanalysis)
+        self.btn_clear_spikes.clicked.connect(self.clear_spikes)
         self.chk_manual_spike.stateChanged.connect(self.update_spike_mode_link)
     
 
