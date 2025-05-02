@@ -162,15 +162,15 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         wavelet_form = QtWidgets.QFormLayout()
 
         #auto range
-        self.btn_recommend_freq = QtWidgets.QPushButton("Auto Recommend Freqency")
-        wavelet_form.addRow(self.btn_recommend_freq)
-        self.btn_recommend_freq.clicked.connect(self.recommend_freq_range)
+        self.btn_recommend_wavelet_and_freq = QtWidgets.QPushButton("Auto Freqency and Wavelet")
+        wavelet_form.addRow(self.btn_recommend_wavelet_and_freq)
+        self.btn_recommend_wavelet_and_freq.clicked.connect(self.recommend_wavelet_and_freq)
 
         # mother wavelet
         self.combo_wavelet = QtWidgets.QComboBox()
         self.combo_wavelet.addItems(['morl', 'cmor', 'mexh', 'gaus1'])
         wavelet_form.addRow("Mother wavelet:", self.combo_wavelet)
-
+    
         # Frequency
         freq_range_layout = QtWidgets.QHBoxLayout()
         freq_range_layout.setContentsMargins(0, 0, 0, 0)
@@ -643,10 +643,11 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.proc_plot.plotItem.legend.setVisible(show_legend)
     
     def reset_view(self):
+        """Reset zoom without disabling interaction"""
         for plot in [self.raw_plot, self.proc_plot]:
             if plot.listDataItems():
                 plot.enableAutoRange(axis='xy')
-                plot.plotItem.vb.setMouseEnabled(x=not self.chk_use_time.isChecked(), y=not self.chk_use_time.isChecked())
+                plot.plotItem.vb.setMouseEnabled(x=True, y=True)
 
     def reset_proc_view(self):
         if self.proc_plot.listDataItems():
@@ -1175,13 +1176,21 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.manual_spike_scatter.setData(spots)
 
     def update_spike_mode_link(self, state):
-        """When manual spike marking is enabled, link raw/proc x-axis. Otherwise unlink."""
+        """Link X-axis"""
         if state == Qt.Checked:
-            self.proc_plot.setXLink(self.raw_plot)  
+            # Link X axes for better manual marking, but still allow zoom/drag
+            self.proc_plot.setXLink(self.raw_plot)
+            self.raw_plot.plotItem.vb.setMouseEnabled(x=True, y=False)
+            self.proc_plot.plotItem.vb.setMouseEnabled(x=True, y=False)
         else:
-            self.proc_plot.setXLink(None)            
+            self.proc_plot.setXLink(None)
+            self.raw_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
+            self.proc_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
 
-    def recommend_freq_range(self):
+    def recommend_wavelet_and_freq(self):
+        from scipy.signal import find_peaks
+        import numpy as np
+
         if self.proc_signal is None:
             QtWidgets.QMessageBox.warning(self, "Warning", "No processed signal available.")
             return
@@ -1189,33 +1198,38 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         y = self.proc_signal.magnitude.flatten()
         fs = float(self.proc_signal.sampling_rate.rescale('Hz').magnitude)
 
-        from scipy.signal import find_peaks
-
-        # threshold peak
         peaks, _ = find_peaks(y, prominence=np.std(y))
+
         if len(peaks) < 2:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Not enough peaks to estimate.")
-            return
+            wavelet = 'morl'
+            f_low, f_high = 10, 100
+            comment = "Not enough spikes. Defaulting to 'morl' and freq 10–100 Hz."
+        else:
+            widths = np.diff(peaks) / fs
+            typical_width = np.median(widths)
+            typical_ms = typical_width * 1000
 
-        # average spike width
-        widths = np.diff(peaks) / fs  # interval
-        typical_width = np.median(widths)
-        if typical_width <= 0:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Width estimation failed.")
-            return
+            if typical_ms < 3:
+                wavelet = 'mexh'
+                f_low, f_high = 1, 128  # using scale
+                comment = "Sharp spikes (<3 ms) → using 'mexh' with fixed 1–128 range"
+            elif typical_ms < 15:
+                wavelet = 'morl'
+                f_center = 1.0 / typical_width
+                f_low = int(max(1, f_center / 2))
+                f_high = int(min(f_center * 2, fs / 2))
+                comment = f"Moderate spikes (3–15 ms) → 'morl' with {f_low}–{f_high} Hz"
+            else:
+                wavelet = 'cmor1.5-1.0'
+                f_center = 1.0 / typical_width
+                f_low = int(max(1, f_center / 2))
+                f_high = int(min(f_center * 2, fs / 2))
+                comment = f"Broad spikes (>15 ms) → 'cmor1.5-1.0' with {f_low}–{f_high} Hz"
 
-        # range
-        f_center = 1.0 / typical_width
-        f_low = max(1, int(f_center / 2))
-        f_high = min(int(f_center * 2), int(fs / 2)) 
+        # return to ui
+        self.combo_wavelet.setCurrentText(wavelet)
         self.freq_low.setValue(f_low)
         self.freq_high.setValue(f_high)
-
-        QtWidgets.QMessageBox.information(
-            self, "Recommended Frequency Range",
-            f"Estimated spike width: {typical_width*1000:.1f} ms\n"
-            f"Recommended frequency range: {f_low}–{f_high} Hz"
-        )
 
 
     def apply_detect(self):
@@ -1528,6 +1542,18 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             dt = 1.0 / fs
             t_rel = (signal.times - signal.t_start).rescale('s').magnitude.flatten()
             t_abs = signal.times.rescale('s').magnitude.flatten()
+
+            #time shift
+            sweep_offset = 0
+            if '_sweep' in key:
+                try:
+                    sweep_index = int(key.split('_sweep')[-1])
+                    duration = t_abs[-1] - t_abs[0]  # sweep lasting
+                    sweep_offset = sweep_index * duration
+                except:
+                    pass
+
+            t_abs += sweep_offset
 
             info = self.get_spike_info(key=key)
             if info is None:
