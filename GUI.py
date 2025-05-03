@@ -161,32 +161,45 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         wavelet_group = QtWidgets.QGroupBox("Wavelet Settings")
         wavelet_form = QtWidgets.QFormLayout()
 
-        #auto range
-        self.btn_recommend_wavelet_and_freq = QtWidgets.QPushButton("Auto Freqency and Wavelet")
-        wavelet_form.addRow(self.btn_recommend_wavelet_and_freq)
-        self.btn_recommend_wavelet_and_freq.clicked.connect(self.recommend_wavelet_and_freq)
+        #Auto freq and wavelet
+        freq_recommend_layout = QtWidgets.QHBoxLayout()
+        self.checkbox_auto_wavelet = QtWidgets.QCheckBox("Auto mother wavelet")
+        self.checkbox_auto_wavelet.setChecked(True)
+        self.btn_recommend_freq = QtWidgets.QPushButton("Auto Frequency")
+        self.btn_recommend_freq.clicked.connect(self.recommend_freq_and_wavelet)
+        freq_recommend_layout.addWidget(self.checkbox_auto_wavelet)
+        freq_recommend_layout.addStretch()
+        freq_recommend_layout.addWidget(self.btn_recommend_freq)
 
-        # mother wavelet
+        auto_layout = QtWidgets.QHBoxLayout()
+        auto_layout.addWidget(self.checkbox_auto_wavelet)
+        auto_layout.addSpacing(10) 
+        auto_layout.addWidget(self.btn_recommend_freq)
+        wavelet_form.addRow(auto_layout)
+
+        #Wavelet selector dropdown
         self.combo_wavelet = QtWidgets.QComboBox()
-        self.combo_wavelet.addItems(['morl', 'cmor', 'mexh', 'gaus1'])
-        wavelet_form.addRow("Mother wavelet:", self.combo_wavelet)
-    
-        # Frequency
-        freq_range_layout = QtWidgets.QHBoxLayout()
-        freq_range_layout.setContentsMargins(0, 0, 0, 0)
+        self.combo_wavelet.addItems(['morl','cmor','mexh','gaus1'])
+
+        #Frequency range
         self.freq_low = QtWidgets.QSpinBox()
-        self.freq_low.setRange(1, 1000)
+        self.freq_low.setRange(1, 10000)
         self.freq_low.setValue(20)
         self.freq_high = QtWidgets.QSpinBox()
-        self.freq_high.setRange(1, 2000)
+        self.freq_high.setRange(1, 10000)
         self.freq_high.setValue(250)
+
+        freq_range_layout = QtWidgets.QHBoxLayout()
+        dash_label = QtWidgets.QLabel("-")
+        dash_label.setAlignment(Qt.AlignCenter)
+        dash_label.setFixedWidth(15) 
         freq_range_layout.addWidget(self.freq_low)
-        freq_range_layout.addWidget(QtWidgets.QLabel(" - "))
+        freq_range_layout.addWidget(dash_label)
         freq_range_layout.addWidget(self.freq_high)
 
-        freq_widget = QtWidgets.QWidget()
-        freq_widget.setLayout(freq_range_layout)
-        wavelet_form.addRow("Freq Range (Hz):", freq_widget)
+        #Layout
+        wavelet_form.addRow("Mother wavelet:", self.combo_wavelet)
+        wavelet_form.addRow("Freq Range (Hz):", freq_range_layout)
 
         # Threshold
         self.wavelet_thresh = QtWidgets.QDoubleSpinBox()
@@ -245,6 +258,10 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         spike_layout.addLayout(manual_layout)
 
         # Spike window settings
+        self.chk_auto_ap_window = QtWidgets.QCheckBox("Auto AP Analysis Window")
+        self.chk_auto_ap_window.setChecked(True)
+        spike_layout.addWidget(self.chk_auto_ap_window)
+
         window_layout = QtWidgets.QHBoxLayout()
         window_layout.addWidget(QtWidgets.QLabel('Pre AP (ms):'))
         self.spin_window_pre = QtWidgets.QSpinBox()
@@ -1135,7 +1152,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         manual_amps.pop()
         self.update_manual_spike_scatter()
 
-
     #spike detect
     def get_spike_info(self, key=None, create=False):
         """Get spike_info dict for the given key (default current), optionally create if missing."""
@@ -1187,49 +1203,103 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.raw_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
             self.proc_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
 
-    def recommend_wavelet_and_freq(self):
+    def estimate_freq_from_isi(self, y, fs):
         from scipy.signal import find_peaks
-        import numpy as np
+        peaks, _ = find_peaks(y, prominence=np.std(y))
 
-        if self.proc_signal is None:
-            QtWidgets.QMessageBox.warning(self, "Warning", "No processed signal available.")
-            return
+        if len(peaks) < 2:
+            return 20, 250, "Not enough spikes. Defaulting to 20–250 Hz."
+
+        isi_sec = np.diff(peaks) / fs
+        typical_period = np.median(isi_sec)
+        f_center = min(1.0 / typical_period, 500)
+        f_low = int(max(1, f_center / 2))
+        f_high = int(min(fs / 2, f_center * 2))
+
+        comment = f"Estimated center freq: {f_center:.1f} Hz, set range: {f_low}–{f_high} Hz"
+        return f_low, f_high, comment
+
+    def recommend_wavelet_by_shape(self, y, fs, f_low, f_high):
+        from scipy.signal import find_peaks, peak_widths
+
+        peaks, props = find_peaks(y, prominence=np.std(y))
+        if len(peaks) == 0:
+            return 'cmor', "No spikes detected. Defaulting to 'cmor'.", (f_low, f_high)
+
+        main_idx = peaks[np.argmax(props['prominences'])]
+        width_samples = peak_widths(y, [main_idx], rel_height=0.5)[0][0]
+        width_ms = width_samples / fs * 1000
+        spike_freq = 1000.0 / width_ms
+
+        comment = f"Spike width: ~{width_ms:.2f} ms, inferred freq: ~{spike_freq:.1f} Hz\n"
+
+        if spike_freq >= 150:
+            preferred = 'gaus1'
+            comment += "'gaus1' for sharp, short spikes.\n"
+            target_band = (80, 500)
+        elif spike_freq >= 40:
+            preferred = 'cmor1.5-1.0'
+            comment += "'cmor1.5-1.0' for moderately fast spikes.\n"
+            target_band = (20, 300)
+        else:
+            preferred = 'morl'
+            comment += "'morl' for broad spikes.\n"
+            target_band = (5, 100)
+
+        isi_band = (f_low, f_high)
+        overlap = not (target_band[1] < isi_band[0] or target_band[0] > isi_band[1])
+        if not overlap:
+            comment += f"⚠️ ISI freq [{f_low}-{f_high}] Hz does not overlap with '{preferred}' band {target_band}. Falling back.\n"
+            if isi_band[1] >= 150:
+                fallback = 'gaus1'
+                fallback_band = (80, 500)
+            elif isi_band[1] >= 40:
+                fallback = 'cmor1.5-1.0'
+                fallback_band = (20, 300)
+            else:
+                fallback = 'morl'
+                fallback_band = (5, 100)
+            comment += f"Using fallback wavelet: '{fallback}'"
+            return fallback, comment, fallback_band
+
+        return preferred, comment, target_band
+
+    def recommend_freq_and_wavelet(self):
+        import pywt
 
         y = self.proc_signal.magnitude.flatten()
         fs = float(self.proc_signal.sampling_rate.rescale('Hz').magnitude)
 
-        peaks, _ = find_peaks(y, prominence=np.std(y))
+        f_low_est, f_high_est, f_comment = self.estimate_freq_from_isi(y, fs)
+        comment = f_comment
 
-        if len(peaks) < 2:
-            wavelet = 'morl'
-            f_low, f_high = 10, 100
-            comment = "Not enough spikes. Defaulting to 'morl' and freq 10–100 Hz."
+        if self.checkbox_auto_wavelet.isChecked():
+            wavelet, wavelet_comment, freq_band = self.recommend_wavelet_by_shape(y, fs, f_low_est, f_high_est)
+            f_low, f_high = freq_band
+            self.combo_wavelet.setCurrentText(wavelet)
+            comment += "\n" + wavelet_comment
         else:
-            widths = np.diff(peaks) / fs
-            typical_width = np.median(widths)
-            typical_ms = typical_width * 1000
+            f_low, f_high = f_low_est, f_high_est
 
-            if typical_ms < 3:
-                wavelet = 'mexh'
-                f_low, f_high = 1, 128  # using scale
-                comment = "Sharp spikes (<3 ms) → using 'mexh' with fixed 1–128 range"
-            elif typical_ms < 15:
-                wavelet = 'morl'
-                f_center = 1.0 / typical_width
-                f_low = int(max(1, f_center / 2))
-                f_high = int(min(f_center * 2, fs / 2))
-                comment = f"Moderate spikes (3–15 ms) → 'morl' with {f_low}–{f_high} Hz"
-            else:
-                wavelet = 'cmor1.5-1.0'
-                f_center = 1.0 / typical_width
-                f_low = int(max(1, f_center / 2))
-                f_high = int(min(f_center * 2, fs / 2))
-                comment = f"Broad spikes (>15 ms) → 'cmor1.5-1.0' with {f_low}–{f_high} Hz"
+        # prevent center_frequency = None
+        wavelet_name = self.combo_wavelet.currentText()
+        try:
+            center_freq = pywt.ContinuousWavelet(wavelet_name).center_frequency
+            if center_freq is None:
+                raise ValueError()
+        except Exception:
+            center_freq = 1.0
+            comment += f"\n⚠️ Wavelet '{wavelet_name}' has undefined center frequency. Using fallback center frequency = 1.0."
 
-        # return to ui
-        self.combo_wavelet.setCurrentText(wavelet)
-        self.freq_low.setValue(f_low)
-        self.freq_high.setValue(f_high)
+        max_allowed_freq = center_freq * fs
+        if f_high > max_allowed_freq:
+            f_high = int(max_allowed_freq)
+            comment += f"\n⚠️ High frequency clipped to {f_high} Hz to ensure valid scales."
+
+        self.freq_low.setValue(max(1, int(f_low)))
+        self.freq_high.setValue(max(int(f_low + 1), int(f_high)))
+
+        QtWidgets.QMessageBox.information(self, "Recommendation", comment)
 
 
     def apply_detect(self):
@@ -1508,8 +1578,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
     #AP
     def apanalysis(self):
-        """Analyze and export spike features with corrected units and stable rise/decay time extraction, and save both relative and absolute spike times."""
-
+        """Analyze and export spike features: each spike as one row with auto-detected window per sweep."""
         from scipy.signal import find_peaks, peak_widths
 
         selected_items = self.file_tree.selectedItems()
@@ -1517,17 +1586,10 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected for AP analysis.")
             return
 
-        if self.last_folder:
-            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder to Save CSV Files", self.last_folder)
-        else:
-            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder to Save CSV Files")
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder to Save CSV Files", self.last_folder or "")
         if not folder:
             return
-
         self.last_folder = folder
-
-        window_pre_ms = self.spin_window_pre.value()
-        window_post_ms = self.spin_window_post.value()
 
         results_by_file = {}
 
@@ -1543,16 +1605,15 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             t_rel = (signal.times - signal.t_start).rescale('s').magnitude.flatten()
             t_abs = signal.times.rescale('s').magnitude.flatten()
 
-            #time shift
+            # time offset
             sweep_offset = 0
             if '_sweep' in key:
                 try:
                     sweep_index = int(key.split('_sweep')[-1])
-                    duration = t_abs[-1] - t_abs[0]  # sweep lasting
+                    duration = t_abs[-1] - t_abs[0]
                     sweep_offset = sweep_index * duration
                 except:
                     pass
-
             t_abs += sweep_offset
 
             info = self.get_spike_info(key=key)
@@ -1570,98 +1631,78 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
             spike_times = np.sort(np.array(spike_times))
 
+            # ✅ 自动估算 rise/decay
+            rise_times, decay_times = [], []
+            for spk_time in spike_times[:10]:
+                idx_center = np.argmin(np.abs(t_rel - spk_time))
+                idx_start = max(0, idx_center - int(0.005 / dt))
+                idx_end = min(len(signal_y), idx_center + int(0.005 / dt))
+                ep_y = signal_y[idx_start:idx_end]
+                if len(ep_y) == 0: continue
+                peaks, _ = find_peaks(ep_y)
+                if not len(peaks): continue
+                peak_idx = peaks[np.argmax(ep_y[peaks])]
+                half_amp = ep_y[peak_idx] / 2.0
+                left = ep_y[:peak_idx]
+                right = ep_y[peak_idx:]
+                rise = np.where(left <= half_amp)[0]
+                decay = np.where(right <= half_amp)[0]
+                if len(rise): rise_times.append((peak_idx - rise[-1]) * dt * 1000)
+                if len(decay): decay_times.append(decay[0] * dt * 1000)
+
+            window_pre_ms = min(np.median(rise_times) * 1.5, 50) if rise_times else 10
+            window_post_ms = min(np.median(decay_times) * 1.5, 50) if decay_times else 20
+
             if 'zeroed' in key.lower():
                 baseline = extract_baseline_value(signal_y, method='mode')
             else:
                 baseline = 0.0
 
-            features = {
-                'Spike Relative Time (ms)': [],
-                'Spike Absolute Time (ms)': [],
-                'Width (ms)': [],
-                'Amplitude (mV)': [],
-                'Prominence (mV)': [],
-                'Rise Time (ms)': [],
-                'Decay Time (ms)': [],
-                'ISI (ms)': []
-            }
+            base_name = key.split('_sweep')[0]
+            sweep_id = key.split('_sweep')[-1] if '_sweep' in key else '0'
+            results_by_file.setdefault(base_name, [])
 
-            last_spike_time_abs = None
-
-            for spk_time in spike_times:
+            for i, spk_time in enumerate(spike_times):
                 idx_center = np.argmin(np.abs(t_rel - spk_time))
-
                 idx_start = max(0, idx_center - int(window_pre_ms/1000/dt))
                 idx_end = min(len(signal_y), idx_center + int(window_post_ms/1000/dt))
-
                 ep_y = signal_y[idx_start:idx_end]
                 ep_t = t_rel[idx_start:idx_end] - t_rel[idx_center]
-
                 if len(ep_y) == 0:
                     continue
-
                 peaks, properties = find_peaks(ep_y, prominence=0)
                 if len(peaks) == 0:
                     continue
-
                 peak_idx = peaks[np.argmax(ep_y[peaks])]
                 amp = ep_y[peak_idx] + baseline
                 prominence = properties['prominences'][np.argmax(ep_y[peaks])]
                 width = peak_widths(ep_y, [peak_idx], rel_height=0.5)[0][0] * dt * 1000
-
                 half_amp = ep_y[peak_idx] / 2.0
-
                 left_part = ep_y[:peak_idx]
                 rise_candidates = np.where(left_part <= half_amp)[0]
-                if len(rise_candidates) > 0:
-                    rise_time = (peak_idx - rise_candidates[-1]) * dt * 1000
-                else:
-                    rise_time = np.nan
-
+                rise_time = (peak_idx - rise_candidates[-1]) * dt * 1000 if len(rise_candidates) > 0 else np.nan
                 right_part = ep_y[peak_idx:]
                 decay_candidates = np.where(right_part <= half_amp)[0]
-                if len(decay_candidates) > 0:
-                    decay_time = decay_candidates[0] * dt * 1000
-                else:
-                    decay_time = np.nan
+                decay_time = decay_candidates[0] * dt * 1000 if len(decay_candidates) > 0 else np.nan
+                isi = (spike_times[i] - spike_times[i-1]) * 1000 if i > 0 else np.nan
+                spike_data = {
+                    'Sweep': f'sweep{sweep_id}',
+                    'Spike Index': i + 1,
+                    'Spike Relative Time (ms)': t_rel[idx_center] * 1000,
+                    'Spike Absolute Time (ms)': t_abs[idx_center] * 1000,
+                    'Width (ms)': width,
+                    'Amplitude (mV)': amp,
+                    'Prominence (mV)': prominence,
+                    'Rise Time (ms)': rise_time,
+                    'Decay Time (ms)': decay_time,
+                    'ISI (ms)': isi
+                }
+                results_by_file[base_name].append(spike_data)
 
-                features['Spike Relative Time (ms)'].append(t_rel[idx_center] * 1000)
-                features['Spike Absolute Time (ms)'].append(t_abs[idx_center] * 1000)
-                features['Width (ms)'].append(width)
-                features['Amplitude (mV)'].append(amp)
-                features['Prominence (mV)'].append(prominence)
-                features['Rise Time (ms)'].append(rise_time)
-                features['Decay Time (ms)'].append(decay_time)
-
-                if last_spike_time_abs is None:
-                    features['ISI (ms)'].append(np.nan)
-                else:
-                    features['ISI (ms)'].append((t_abs[idx_center] - last_spike_time_abs) * 1000)
-
-                last_spike_time_abs = t_abs[idx_center]
-
-            if not features['Spike Relative Time (ms)']:
-                continue
-
-            base_name = key.split('_sweep')[0]
-
-            if base_name not in results_by_file:
-                results_by_file[base_name] = []
-
-            results_by_file[base_name].append(features)
-
-        for base_name, features_list in results_by_file.items():
-            combined = {k: [] for k in features_list[0].keys()}
-
-            for feat in features_list:
-                for k, v in feat.items():
-                    combined[k].extend(v)
-
-            df = pd.DataFrame(combined).transpose()
-            df.columns = [f"Spike{i+1}" for i in range(df.shape[1])]
-
+        for base_name, spike_list in results_by_file.items():
+            df = pd.DataFrame(spike_list)
             save_path = os.path.join(folder, f"{base_name}_apanalysis.csv")
-            df.to_csv(save_path, header=True)
+            df.to_csv(save_path, index=False)
 
         QtWidgets.QMessageBox.information(self, "Export Done", "AP Analysis completed!")
 
