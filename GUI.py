@@ -13,6 +13,7 @@ from PyQt5.QtCore import QSettings, QDir, Qt
 from functools import partial
 from scipy.sparse.linalg import spsolve
 from scipy.ndimage import uniform_filter1d
+from scipy.signal import find_peaks, peak_widths
 
 class LFPAnalyzer(QtWidgets.QMainWindow):
     def __init__(self):
@@ -34,7 +35,10 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self._create_main_layout()
         self.raw_plot.addLegend()
         self.raw_plot.plotItem.legend.setVisible(False)
-        self.combo_wavelet.setCurrentText('cmor')
+
+        # wavelet spinbox
+        self.combo_wavelet.setCurrentText('cmor1.5-1.0')
+        self.combo_wavelet.currentTextChanged.connect(self.on_wavelet_changed)
 
         #enable drag
         self.raw_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
@@ -179,7 +183,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         #Wavelet selector dropdown
         self.combo_wavelet = QtWidgets.QComboBox()
-        self.combo_wavelet.addItems(['morl','cmor','mexh','gaus1'])
+        self.combo_wavelet.addItems(['morl','cmor1.5-1.0','mexh','gaus1'])
 
         #Frequency range
         self.freq_low = QtWidgets.QSpinBox()
@@ -1204,27 +1208,31 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.proc_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
 
     def estimate_freq_from_isi(self, y, fs):
-        from scipy.signal import find_peaks
+        """
+        Estimate frequency range based on inter-spike intervals (ISI).
+        This function detects peaks, computes ISIs, and converts to frequency.
+        """
         peaks, _ = find_peaks(y, prominence=np.std(y))
-
         if len(peaks) < 2:
             return 20, 250, "Not enough spikes. Defaulting to 20–250 Hz."
 
-        isi_sec = np.diff(peaks) / fs
-        typical_period = np.median(isi_sec)
-        f_center = min(1.0 / typical_period, 500)
+        isi_sec = np.diff(peaks) / fs  # ISI in seconds
+        typical_period = np.median(isi_sec)  # Use median for robustness
+        f_center = min(1.0 / typical_period, 250)  # Cap frequency to 250 Hz
         f_low = int(max(1, f_center / 2))
         f_high = int(min(fs / 2, f_center * 2))
 
         comment = f"Estimated center freq: {f_center:.1f} Hz, set range: {f_low}–{f_high} Hz"
         return f_low, f_high, comment
 
-    def recommend_wavelet_by_shape(self, y, fs, f_low, f_high):
-        from scipy.signal import find_peaks, peak_widths
-
+    def recommend_wavelet_by_shape(self, y, fs):
+        """
+        Select a wavelet based on spike shape (specifically, the spike width).
+        Ensures recommended frequency range is within wavelet-safe limits.
+        """
         peaks, props = find_peaks(y, prominence=np.std(y))
         if len(peaks) == 0:
-            return 'cmor', "No spikes detected. Defaulting to 'cmor'.", (f_low, f_high)
+            return 'cmor1.5-1.0', "No peaks found. Defaulting to 'cmor1.5-1.0'.", (20, 250)
 
         main_idx = peaks[np.argmax(props['prominences'])]
         width_samples = peak_widths(y, [main_idx], rel_height=0.5)[0][0]
@@ -1233,101 +1241,176 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         comment = f"Spike width: ~{width_ms:.2f} ms, inferred freq: ~{spike_freq:.1f} Hz\n"
 
+        # Default suggestion
         if spike_freq >= 150:
-            preferred = 'gaus1'
-            comment += "'gaus1' for sharp, short spikes.\n"
-            target_band = (80, 500)
+            wavelet = 'gaus1'
         elif spike_freq >= 40:
-            preferred = 'cmor1.5-1.0'
-            comment += "'cmor1.5-1.0' for moderately fast spikes.\n"
-            target_band = (20, 300)
+            wavelet = 'cmor1.5-1.0'
         else:
-            preferred = 'morl'
-            comment += "'morl' for broad spikes.\n"
-            target_band = (5, 100)
+            wavelet = 'morl'
 
-        isi_band = (f_low, f_high)
-        overlap = not (target_band[1] < isi_band[0] or target_band[0] > isi_band[1])
-        if not overlap:
-            comment += f"⚠️ ISI freq [{f_low}-{f_high}] Hz does not overlap with '{preferred}' band {target_band}. Falling back.\n"
-            if isi_band[1] >= 150:
-                fallback = 'gaus1'
-                fallback_band = (80, 500)
-            elif isi_band[1] >= 40:
-                fallback = 'cmor1.5-1.0'
-                fallback_band = (20, 300)
-            else:
-                fallback = 'morl'
-                fallback_band = (5, 100)
-            comment += f"Using fallback wavelet: '{fallback}'"
-            return fallback, comment, fallback_band
+        # Define safe bounds per wavelet
+        safe_band = {
+            'gaus1': (30, 100),
+            'mexh': (10, 80),
+            'morl': (5, 80),
+            'cmor1.5-1.0': (20, 250),
+        }
 
-        return preferred, comment, target_band
+        # Estimate base band around spike freq
+        f_lo = int(max(1, spike_freq / 2))
+        f_hi = int(min(fs / 2, spike_freq * 2))
+        est_band = (f_lo, f_hi)
+
+        # Apply clip to wavelet-safe band
+        lo_safe, hi_safe = safe_band[wavelet]
+        final_band = (max(lo_safe, f_lo), min(hi_safe, f_hi))
+
+        if final_band[0] >= final_band[1]:
+            # fallback if no valid overlap
+            wavelet = 'cmor1.5-1.0'
+            final_band = safe_band[wavelet]
+            comment += "⚠️ Chosen wavelet band not viable; fallback to 'cmor1.5-1.0'.\n"
+        else:
+            comment += f"Recommended wavelet: '{wavelet}' with safe band {final_band} Hz."
+
+        return wavelet, comment, final_band
 
     def recommend_freq_and_wavelet(self):
-        import pywt
-
+        """
+        Always estimate and set ISI-based freq band on click.
+        If “Auto mother wavelet” is checked, also pick/adjust the wavelet.
+        """
         y = self.proc_signal.magnitude.flatten()
         fs = float(self.proc_signal.sampling_rate.rescale('Hz').magnitude)
 
+        # Step 1: Estimate ISI-based band
         f_low_est, f_high_est, f_comment = self.estimate_freq_from_isi(y, fs)
-        comment = f_comment
+        # Always apply ISI estimate to spinboxes
+        self.freq_low.setValue(f_low_est)
+        self.freq_high.setValue(f_high_est)
 
+        comment = "[Step 1] ISI-based frequency range:\n" + f_comment
+
+        # Only if auto-wavelet is enabled do we adjust the wavelet dropdown
         if self.checkbox_auto_wavelet.isChecked():
-            wavelet, wavelet_comment, freq_band = self.recommend_wavelet_by_shape(y, fs, f_low_est, f_high_est)
-            f_low, f_high = freq_band
+            # Step 2: If low-frequency LFP, pick a real wavelet
+            if f_high_est <= 80:
+                wavelet = 'gaus1' if f_high_est <= 40 else 'mexh'
+                comment += (
+                    f"\n\n[Step 2] Rhythem LFP detected (≤80 Hz); "
+                    f"selecting real wavelet '{wavelet}'."
+                )
+                self.freq_low.setValue(f_low_est)
+                self.freq_high.setValue(f_high_est)
+            else:
+                # Shape-based suggestion for higher freqs
+                wavelet, shape_comment, shape_band = self.recommend_wavelet_by_shape(y, fs)
+                comment += "\n\n[Step 2] Shape-based suggestion:\n" + shape_comment
+
+                real_wavelets = ['morl', 'mexh', 'gaus1']
+                if wavelet in real_wavelets:
+                    lo_s, hi_s = shape_band
+                    isi_lo, isi_hi = f_low_est, f_high_est
+                    inter = max(0, min(hi_s, isi_hi) - max(lo_s, isi_lo))
+                    uni = max(hi_s, isi_hi) - min(lo_s, isi_lo)
+                    overlap = (inter / uni) if uni > 0 else 0
+
+                    if overlap > 0.3:
+                        comment += (
+                            f"\n\n✅ Real wavelet '{wavelet}' overlaps ISI band "
+                            f"{(isi_lo, isi_hi)} (ratio {overlap:.2f}); accepting."
+                        )
+                    else:
+                        old = wavelet
+                        wavelet = 'cmor1.5-1.0'
+                        comment += (
+                            f"\n\n⚠️ Real wavelet '{old}' does not overlap ISI band "
+                            f"{(isi_lo, isi_hi)} enough; falling back to '{wavelet}'."
+                        )
+                # complex wavelet case doesn’t need extra action
+            # update the dropdown to final choice
             self.combo_wavelet.setCurrentText(wavelet)
-            comment += "\n" + wavelet_comment
         else:
-            f_low, f_high = f_low_est, f_high_est
+            comment += "\n\nNote: Auto-wavelet is disabled; only ISI-based freq band applied."
 
-        # prevent center_frequency = None
-        wavelet_name = self.combo_wavelet.currentText()
-        try:
-            center_freq = pywt.ContinuousWavelet(wavelet_name).center_frequency
-            if center_freq is None:
-                raise ValueError()
-        except Exception:
-            center_freq = 1.0
-            comment += f"\n⚠️ Wavelet '{wavelet_name}' has undefined center frequency. Using fallback center frequency = 1.0."
+        # Step 3: show summary dialog
+        QtWidgets.QMessageBox.information(
+            self,
+            "Wavelet & Frequency Recommendation",
+            comment
+        )
 
-        max_allowed_freq = center_freq * fs
-        if f_high > max_allowed_freq:
-            f_high = int(max_allowed_freq)
-            comment += f"\n⚠️ High frequency clipped to {f_high} Hz to ensure valid scales."
+    def on_wavelet_changed(self, wavelet_name):
+        """
+        If user selects a real wavelet, auto-update frequency spinboxes to safe range.
+        """
+        safe_ranges = {
+            'gaus1': (30, 100),
+            'mexh': (10, 80),
+            'morl': (5, 80),
+        }
 
-        self.freq_low.setValue(max(1, int(f_low)))
-        self.freq_high.setValue(max(int(f_low + 1), int(f_high)))
-
-        QtWidgets.QMessageBox.information(self, "Recommendation", comment)
-
+        if wavelet_name in safe_ranges:
+            lo, hi = safe_ranges[wavelet_name]
+            self.freq_low.setValue(lo)
+            self.freq_high.setValue(hi)
 
     def apply_detect(self):
+        """
+        Apply wavelet-based spike detection based on current GUI settings.
+        Ensures that real wavelets (without center freq) are not mapped incorrectly.
+        """
         if self.proc_key is None or self.proc_key not in self.signals:
-            QtWidgets.QMessageBox.warning(self, "Warning", "No processed signal found. Please run ALS or Zero Baseline first.")
+            QtWidgets.QMessageBox.warning(self, "Warning", "No processed signal found. Run ALS or baseline removal first.")
             return
 
         signal = self.signals[self.proc_key]
-        self.proc_signal = signal  # renew proc_signal
+        self.proc_signal = signal  # refresh
 
         y = signal.magnitude.flatten()
         fs = float(signal.sampling_rate.rescale('Hz').magnitude)
 
         wavelet_name = self.combo_wavelet.currentText()
-        low_f = self.freq_low.value()
-        high_f = self.freq_high.value()
+        f_low = self.freq_low.value()
+        f_high = self.freq_high.value()
         threshold_std = self.wavelet_thresh.value()
 
+        # Get center frequency if available (optional), else fallback to default scaling safety
+        try:
+            wavelet_obj = pywt.ContinuousWavelet(wavelet_name)
+            center_freq = wavelet_obj.center_frequency or 1.0  # safe default
+        except Exception:
+            center_freq = 1.0  # fallback for robustness
+
+        max_allowed_freq = fs * center_freq
+        if f_high > max_allowed_freq:
+            f_high = int(max_allowed_freq)
+            QtWidgets.QMessageBox.warning(
+                self, "Frequency Clipped",
+                f"High frequency clipped to {f_high} Hz to ensure valid wavelet scales."
+            )
+
+        # Validate frequency range against center_freq * fs
+        max_allowed_freq = center_freq * fs
+        if f_high > max_allowed_freq:
+            f_high = int(max_allowed_freq)
+            QtWidgets.QMessageBox.warning(
+                self, "Frequency Clipped",
+                f"High frequency clipped to {f_high} Hz to ensure valid wavelet scales."
+            )
+
+        # Call core detection
         try:
             spike_idx = wavelet_spike_detect(
                 y, fs,
-                freq_range=(low_f, high_f),
+                freq_range=(f_low, f_high),
                 threshold_std=threshold_std,
                 wavelet_name=wavelet_name
             )
 
             if spike_idx is None or len(spike_idx) == 0:
-                QtWidgets.QMessageBox.information(self, "No Spikes", "No spikes detected in the current settings.")
+                QtWidgets.QMessageBox.information(self, "No Spikes", "No spikes detected with current settings.")
                 return
 
             auto_times = self.get_relative_time(signal, spike_idx, mode='index')
@@ -1973,9 +2056,6 @@ def extract_baseline_value(y, method='mode', sample_size=10000):
 
 #spike detect
 def wavelet_spike_detect(signal, fs, freq_range=(80, 250), threshold_std=3, wavelet_name='morl'):
-    if wavelet_name == "cmor":
-        wavelet_name = "cmor1.5-1.0"
-
     wavelet = pywt.ContinuousWavelet(wavelet_name)
 
     try:
