@@ -1225,57 +1225,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         comment = f"Estimated center freq: {f_center:.1f} Hz, set range: {f_low}–{f_high} Hz"
         return f_low, f_high, comment
 
-    def recommend_wavelet_by_shape(self, y, fs):
-        """
-        Select a wavelet based on spike shape (specifically, the spike width).
-        Ensures recommended frequency range is within wavelet-safe limits.
-        """
-        peaks, props = find_peaks(y, prominence=np.std(y))
-        if len(peaks) == 0:
-            return 'cmor1.5-1.0', "No peaks found. Defaulting to 'cmor1.5-1.0'.", (20, 250)
-
-        main_idx = peaks[np.argmax(props['prominences'])]
-        width_samples = peak_widths(y, [main_idx], rel_height=0.5)[0][0]
-        width_ms = width_samples / fs * 1000
-        spike_freq = 1000.0 / width_ms
-
-        comment = f"Spike width: ~{width_ms:.2f} ms, inferred freq: ~{spike_freq:.1f} Hz\n"
-
-        # Default suggestion
-        if spike_freq >= 150:
-            wavelet = 'gaus1'
-        elif spike_freq >= 40:
-            wavelet = 'cmor1.5-1.0'
-        else:
-            wavelet = 'morl'
-
-        # Define safe bounds per wavelet
-        safe_band = {
-            'gaus1': (30, 100),
-            'mexh': (10, 80),
-            'morl': (5, 80),
-            'cmor1.5-1.0': (20, 250),
-        }
-
-        # Estimate base band around spike freq
-        f_lo = int(max(1, spike_freq / 2))
-        f_hi = int(min(fs / 2, spike_freq * 2))
-        est_band = (f_lo, f_hi)
-
-        # Apply clip to wavelet-safe band
-        lo_safe, hi_safe = safe_band[wavelet]
-        final_band = (max(lo_safe, f_lo), min(hi_safe, f_hi))
-
-        if final_band[0] >= final_band[1]:
-            # fallback if no valid overlap
-            wavelet = 'cmor1.5-1.0'
-            final_band = safe_band[wavelet]
-            comment += "⚠️ Chosen wavelet band not viable; fallback to 'cmor1.5-1.0'.\n"
-        else:
-            comment += f"Recommended wavelet: '{wavelet}' with safe band {final_band} Hz."
-
-        return wavelet, comment, final_band
-
     def recommend_freq_and_wavelet(self):
         """
         Always estimate and set ISI-based freq band on click.
@@ -1286,53 +1235,29 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         # Step 1: Estimate ISI-based band
         f_low_est, f_high_est, f_comment = self.estimate_freq_from_isi(y, fs)
-        # Always apply ISI estimate to spinboxes
         self.freq_low.setValue(f_low_est)
         self.freq_high.setValue(f_high_est)
 
         comment = "[Step 1] ISI-based frequency range:\n" + f_comment
 
-        # Only if auto-wavelet is enabled do we adjust the wavelet dropdown
+        # Step 2: Wavelet suggestion based purely on ISI band
         if self.checkbox_auto_wavelet.isChecked():
-            # Step 2: If low-frequency LFP, pick a real wavelet
-            if f_high_est <= 80:
-                wavelet = 'gaus1' if f_high_est <= 40 else 'mexh'
-                comment += (
-                    f"\n\n[Step 2] Rhythem LFP detected (≤80 Hz); "
-                    f"selecting real wavelet '{wavelet}'."
-                )
-                self.freq_low.setValue(f_low_est)
-                self.freq_high.setValue(f_high_est)
+            if f_high_est <= 40:
+                wavelet = 'mexh'
+            elif f_high_est <= 80:
+                wavelet = 'gaus1'
             else:
-                # Shape-based suggestion for higher freqs
-                wavelet, shape_comment, shape_band = self.recommend_wavelet_by_shape(y, fs)
-                comment += "\n\n[Step 2] Shape-based suggestion:\n" + shape_comment
+                wavelet = 'cmor1.5-1.0'
 
-                real_wavelets = ['morl', 'mexh', 'gaus1']
-                if wavelet in real_wavelets:
-                    lo_s, hi_s = shape_band
-                    isi_lo, isi_hi = f_low_est, f_high_est
-                    inter = max(0, min(hi_s, isi_hi) - max(lo_s, isi_lo))
-                    uni = max(hi_s, isi_hi) - min(lo_s, isi_lo)
-                    overlap = (inter / uni) if uni > 0 else 0
+            comment += (
+                f"\n\n[Step 2] Based on ISI-estimated freq range ({f_low_est}-{f_high_est} Hz), "
+                f"selected wavelet: '{wavelet}'."
+            )
 
-                    if overlap > 0.3:
-                        comment += (
-                            f"\n\n✅ Real wavelet '{wavelet}' overlaps ISI band "
-                            f"{(isi_lo, isi_hi)} (ratio {overlap:.2f}); accepting."
-                        )
-                    else:
-                        old = wavelet
-                        wavelet = 'cmor1.5-1.0'
-                        comment += (
-                            f"\n\n⚠️ Real wavelet '{old}' does not overlap ISI band "
-                            f"{(isi_lo, isi_hi)} enough; falling back to '{wavelet}'."
-                        )
-                # complex wavelet case doesn’t need extra action
-            # update the dropdown to final choice
+            # Apply wavelet choice without triggering signal
+            self.combo_wavelet.blockSignals(True)
             self.combo_wavelet.setCurrentText(wavelet)
-        else:
-            comment += "\n\nNote: Auto-wavelet is disabled; only ISI-based freq band applied."
+            self.combo_wavelet.blockSignals(False)
 
         # Step 3: show summary dialog
         QtWidgets.QMessageBox.information(
@@ -1340,6 +1265,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             "Wavelet & Frequency Recommendation",
             comment
         )
+
 
     def on_wavelet_changed(self, wavelet_name):
         """
