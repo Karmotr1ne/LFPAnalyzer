@@ -1196,17 +1196,15 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.manual_spike_scatter.setData(spots)
 
     def update_spike_mode_link(self, state):
-        """Link X-axis"""
         if state == Qt.Checked:
-            # Link X axes for better manual marking, but still allow zoom/drag
-            self.proc_plot.setXLink(self.raw_plot)
-            self.raw_plot.plotItem.vb.setMouseEnabled(x=True, y=False)
+            self.raw_plot.setXLink(self.proc_plot)
+            self.raw_plot.plotItem.vb.setMouseEnabled(x=False, y=False)
             self.proc_plot.plotItem.vb.setMouseEnabled(x=True, y=False)
         else:
-            self.proc_plot.setXLink(None)
+            self.raw_plot.setXLink(None)
             self.raw_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
             self.proc_plot.plotItem.vb.setMouseEnabled(x=True, y=True)
-
+        
     def estimate_freq_from_isi(self, y, fs):
         """
         Estimate frequency range based on inter-spike intervals (ISI).
@@ -1265,7 +1263,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             "Wavelet & Frequency Recommendation",
             comment
         )
-
 
     def on_wavelet_changed(self, wavelet_name):
         """
@@ -1602,6 +1599,9 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         results_by_file = {}
 
+        missing_prominence_count = 0
+        total_spike_count = 0
+
         for item in selected_items:
             key = item.data(0, QtCore.Qt.UserRole)
             signal = self.signals.get(key, None)
@@ -1625,7 +1625,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                     pass
             t_abs += sweep_offset
 
-            info = self.get_spike_info(key=key)
+            info = self.get_spike_info(key=key,create=True)
             if info is None:
                 continue
 
@@ -1636,28 +1636,40 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 spike_times.extend(info['auto_times'])
 
             if len(spike_times) == 0:
+                print(f"[Skipped] {key}, can't find spike.")
                 continue
-
+            
             spike_times = np.sort(np.array(spike_times))
 
-            # ✅ 自动估算 rise/decay
+            # rise/decay
             rise_times, decay_times = [], []
             for spk_time in spike_times[:10]:
                 idx_center = np.argmin(np.abs(t_rel - spk_time))
                 idx_start = max(0, idx_center - int(0.005 / dt))
                 idx_end = min(len(signal_y), idx_center + int(0.005 / dt))
                 ep_y = signal_y[idx_start:idx_end]
-                if len(ep_y) == 0: continue
-                peaks, _ = find_peaks(ep_y)
-                if not len(peaks): continue
-                peak_idx = peaks[np.argmax(ep_y[peaks])]
-                half_amp = ep_y[peak_idx] / 2.0
-                left = ep_y[:peak_idx]
-                right = ep_y[peak_idx:]
-                rise = np.where(left <= half_amp)[0]
-                decay = np.where(right <= half_amp)[0]
-                if len(rise): rise_times.append((peak_idx - rise[-1]) * dt * 1000)
-                if len(decay): decay_times.append(decay[0] * dt * 1000)
+                if len(ep_y) == 0:
+                    continue
+
+                # derivation
+                dy = np.gradient(ep_y)
+                
+                # max
+                peak_idx = np.argmax(ep_y)
+
+                # Rise
+                if peak_idx > 1:
+                    rise_region = dy[:peak_idx]
+                    rise_idx = np.argmax(rise_region)
+                    rise_time = (peak_idx - rise_idx) * dt * 1000
+                    rise_times.append(rise_time)
+
+                # Decay
+                if peak_idx < len(dy) - 2:
+                    decay_region = dy[peak_idx:]
+                    decay_idx = np.argmin(decay_region)
+                    decay_time = decay_idx * dt * 1000
+                    decay_times.append(decay_time)
 
             window_pre_ms = min(np.median(rise_times) * 1.5, 50) if rise_times else 10
             window_post_ms = min(np.median(decay_times) * 1.5, 50) if decay_times else 20
@@ -1678,10 +1690,22 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 ep_y = signal_y[idx_start:idx_end]
                 ep_t = t_rel[idx_start:idx_end] - t_rel[idx_center]
                 if len(ep_y) == 0:
+                    print(f"[Skipped] {key}, spike{i+1} analysis failed")
                     continue
+
                 peaks, properties = find_peaks(ep_y, prominence=0)
                 if len(peaks) == 0:
-                    continue
+                    peak_idx = np.argmax(ep_y)
+                    prominence = np.nan
+                    missing_prominence_count += 1
+                else:
+                    peak_idx = peaks[np.argmax(ep_y[peaks])]
+                    try:
+                        prominence = properties['prominences'][np.argmax(ep_y[peaks])]
+                    except Exception:
+                        prominence = np.nan
+                        missing_prominence_count += 1
+
                 peak_idx = peaks[np.argmax(ep_y[peaks])]
                 amp = ep_y[peak_idx] + baseline
                 prominence = properties['prominences'][np.argmax(ep_y[peaks])]
@@ -1713,7 +1737,9 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             save_path = os.path.join(folder, f"{base_name}_apanalysis.csv")
             df.to_csv(save_path, index=False)
 
-        QtWidgets.QMessageBox.information(self, "Export Done", "AP Analysis completed!")
+        if missing_prominence_count > 0:
+            message += f"\nSpikes missing prominence: {missing_prominence_count}"
+        QtWidgets.QMessageBox.information(self, "Export Done", message)
 
     #batch
     def batch_preprocess(self):
