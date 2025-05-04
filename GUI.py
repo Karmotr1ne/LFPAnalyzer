@@ -1598,7 +1598,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.last_folder = folder
 
         results_by_file = {}
-
         missing_prominence_count = 0
         total_spike_count = 0
 
@@ -1608,13 +1607,19 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             if signal is None:
                 continue
 
+            # Auto spike detection if needed
+            if key not in self.spike_info or self.spike_info[key].get('auto_times') is None or len(self.spike_info[key].get('auto_times')) == 0:
+                self.proc_key = key
+                self.proc_signal = signal
+                self.apply_detect()
+                self.apply_filter()
+
             signal_y = signal.magnitude.flatten()
             fs = float(signal.sampling_rate.rescale('Hz'))
             dt = 1.0 / fs
             t_rel = (signal.times - signal.t_start).rescale('s').magnitude.flatten()
             t_abs = signal.times.rescale('s').magnitude.flatten()
 
-            # time offset
             sweep_offset = 0
             if '_sweep' in key:
                 try:
@@ -1625,7 +1630,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                     pass
             t_abs += sweep_offset
 
-            info = self.get_spike_info(key=key,create=True)
+            info = self.get_spike_info(key=key, create=True)
             if info is None:
                 continue
 
@@ -1636,12 +1641,11 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 spike_times.extend(info['auto_times'])
 
             if len(spike_times) == 0:
-                print(f"[Skipped] {key}, can't find spike.")
                 continue
-            
+
             spike_times = np.sort(np.array(spike_times))
 
-            # rise/decay
+            # Estimate rise/decay times using slope-based method
             rise_times, decay_times = [], []
             for spk_time in spike_times[:10]:
                 idx_center = np.argmin(np.abs(t_rel - spk_time))
@@ -1650,21 +1654,15 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 ep_y = signal_y[idx_start:idx_end]
                 if len(ep_y) == 0:
                     continue
-
-                # derivation
                 dy = np.gradient(ep_y)
-                
-                # max
                 peak_idx = np.argmax(ep_y)
 
-                # Rise
                 if peak_idx > 1:
                     rise_region = dy[:peak_idx]
                     rise_idx = np.argmax(rise_region)
                     rise_time = (peak_idx - rise_idx) * dt * 1000
                     rise_times.append(rise_time)
 
-                # Decay
                 if peak_idx < len(dy) - 2:
                     decay_region = dy[peak_idx:]
                     decay_idx = np.argmin(decay_region)
@@ -1674,23 +1672,20 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             window_pre_ms = min(np.median(rise_times) * 1.5, 50) if rise_times else 10
             window_post_ms = min(np.median(decay_times) * 1.5, 50) if decay_times else 20
 
-            if 'zeroed' in key.lower():
-                baseline = extract_baseline_value(signal_y, method='mode')
-            else:
-                baseline = 0.0
+            baseline = extract_baseline_value(signal_y, method='mode') if 'zeroed' in key.lower() else 0.0
 
             base_name = key.split('_sweep')[0]
             sweep_id = key.split('_sweep')[-1] if '_sweep' in key else '0'
             results_by_file.setdefault(base_name, [])
 
             for i, spk_time in enumerate(spike_times):
+                total_spike_count += 1
                 idx_center = np.argmin(np.abs(t_rel - spk_time))
-                idx_start = max(0, idx_center - int(window_pre_ms/1000/dt))
-                idx_end = min(len(signal_y), idx_center + int(window_post_ms/1000/dt))
+                idx_start = max(0, idx_center - int(window_pre_ms / 1000 / dt))
+                idx_end = min(len(signal_y), idx_center + int(window_post_ms / 1000 / dt))
                 ep_y = signal_y[idx_start:idx_end]
                 ep_t = t_rel[idx_start:idx_end] - t_rel[idx_center]
                 if len(ep_y) == 0:
-                    print(f"[Skipped] {key}, spike{i+1} analysis failed")
                     continue
 
                 peaks, properties = find_peaks(ep_y, prominence=0)
@@ -1699,17 +1694,23 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                     prominence = np.nan
                     missing_prominence_count += 1
                 else:
-                    peak_idx = peaks[np.argmax(ep_y[peaks])]
-                    try:
-                        prominence = properties['prominences'][np.argmax(ep_y[peaks])]
-                    except Exception:
+                    peak_vals = ep_y[peaks]
+                    if len(peak_vals) == 0:
+                        peak_idx = np.argmax(ep_y)
                         prominence = np.nan
                         missing_prominence_count += 1
+                    else:
+                        best_peak = np.argmax(peak_vals)
+                        peak_idx = peaks[best_peak]
+                        try:
+                            prominence = properties['prominences'][best_peak]
+                        except Exception:
+                            prominence = np.nan
+                            missing_prominence_count += 1
 
-                peak_idx = peaks[np.argmax(ep_y[peaks])]
                 amp = ep_y[peak_idx] + baseline
-                prominence = properties['prominences'][np.argmax(ep_y[peaks])]
                 width = peak_widths(ep_y, [peak_idx], rel_height=0.5)[0][0] * dt * 1000
+
                 half_amp = ep_y[peak_idx] / 2.0
                 left_part = ep_y[:peak_idx]
                 rise_candidates = np.where(left_part <= half_amp)[0]
@@ -1717,7 +1718,9 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 right_part = ep_y[peak_idx:]
                 decay_candidates = np.where(right_part <= half_amp)[0]
                 decay_time = decay_candidates[0] * dt * 1000 if len(decay_candidates) > 0 else np.nan
-                isi = (spike_times[i] - spike_times[i-1]) * 1000 if i > 0 else np.nan
+
+                isi = (spike_times[i] - spike_times[i - 1]) * 1000 if i > 0 else np.nan
+
                 spike_data = {
                     'Sweep': f'sweep{sweep_id}',
                     'Spike Index': i + 1,
@@ -1737,9 +1740,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             save_path = os.path.join(folder, f"{base_name}_apanalysis.csv")
             df.to_csv(save_path, index=False)
 
-        if missing_prominence_count > 0:
-            message += f"\nSpikes missing prominence: {missing_prominence_count}"
-        QtWidgets.QMessageBox.information(self, "Export Done", message)
+        if total_spike_count == 0:
+            QtWidgets.QMessageBox.information(self, "Export Done", "AP Analysis finished.\nNo spikes were detected.")
+        else:
+            message = f"AP Analysis completed!\n\nTotal spikes analyzed: {total_spike_count}"
+            if missing_prominence_count > 0:
+                message += f"\nSpikes missing prominence: {missing_prominence_count}"
+            QtWidgets.QMessageBox.information(self, "Export Done", message)
 
     #batch
     def batch_preprocess(self):
