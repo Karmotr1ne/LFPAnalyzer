@@ -1597,7 +1597,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             return
         self.last_folder = folder
 
-        results_by_file = {}
+        all_spike_rows = []
         missing_prominence_count = 0
         total_spike_count = 0
 
@@ -1674,9 +1674,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
             baseline = extract_baseline_value(signal_y, method='mode') if 'zeroed' in key.lower() else 0.0
 
-            base_name = key.split('_sweep')[0]
             sweep_id = key.split('_sweep')[-1] if '_sweep' in key else '0'
-            results_by_file.setdefault(base_name, [])
 
             for i, spk_time in enumerate(spike_times):
                 total_spike_count += 1
@@ -1710,6 +1708,12 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
                 amp = ep_y[peak_idx] + baseline
                 width = peak_widths(ep_y, [peak_idx], rel_height=0.5)[0][0] * dt * 1000
+                
+                try:
+                    raw_width = peak_widths(ep_y, [peak_idx], rel_height=0.5)[0][0]
+                    width = raw_width * dt * 1000 if raw_width > 0 else np.nan  # 或 ''
+                except Exception:
+                    width = np.nan
 
                 half_amp = ep_y[peak_idx] / 2.0
                 left_part = ep_y[:peak_idx]
@@ -1721,24 +1725,45 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
                 isi = (spike_times[i] - spike_times[i - 1]) * 1000 if i > 0 else np.nan
 
-                spike_data = {
-                    'Sweep': f'sweep{sweep_id}',
-                    'Spike Index': i + 1,
-                    'Spike Relative Time (ms)': t_rel[idx_center] * 1000,
-                    'Spike Absolute Time (ms)': t_abs[idx_center] * 1000,
-                    'Width (ms)': width,
-                    'Amplitude (mV)': amp,
-                    'Prominence (mV)': prominence,
-                    'Rise Time (ms)': rise_time,
-                    'Decay Time (ms)': decay_time,
-                    'ISI (ms)': isi
-                }
-                results_by_file[base_name].append(spike_data)
+            spike_data = {
+                'Sweep': f'sweep{sweep_id}',
+                'Spike Index': i + 1,
+                'Spike Relative Time (ms)': t_rel[idx_center] * 1000,
+                'Spike Absolute Time (ms)': t_abs[idx_center] * 1000,
+                'Width (ms)': width,
+                'Amplitude (mV)': amp,
+                'Prominence (mV)': prominence,
+                'Rise Time (ms)': rise_time,
+                'Decay Time (ms)': decay_time,
+                'ISI (ms)': isi,
+                'Source': key
+            }
+            all_spike_rows.append(spike_data)
+                
+        # check data
+        if not all_spike_rows:
+            QtWidgets.QMessageBox.information(self, "Export Done. No spikes were detected.")
+            return
 
-        for base_name, spike_list in results_by_file.items():
-            df = pd.DataFrame(spike_list)
-            save_path = os.path.join(folder, f"{base_name}_apanalysis.csv")
-            df.to_csv(save_path, index=False)
+        first_key = selected_items[0].data(0, QtCore.Qt.UserRole)
+        base_name = first_key.split('_sweep')[0]
+        suggested_name = f"{base_name}_apanalysis.csv"
+
+        # save
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Combined AP Analysis",
+            os.path.join(self.last_folder or "", suggested_name),
+            "CSV Files (*.csv)"
+        )
+
+        if not file_path:
+            return 
+        
+        self.last_folder = os.path.dirname(file_path)
+
+        df = pd.DataFrame(all_spike_rows)
+        df.to_csv(file_path, index=False)
 
         if total_spike_count == 0:
             QtWidgets.QMessageBox.information(self, "Export Done", "AP Analysis finished.\nNo spikes were detected.")
