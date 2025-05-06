@@ -1542,7 +1542,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.reset_raw_view()
             return
 
-        # 找不到原始数据
         QtWidgets.QMessageBox.warning(
             self, "Missing Raw Data",
             f"Original raw signal for '{self.current_key}' not found."
@@ -1584,18 +1583,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
     #AP
     def apanalysis(self):
-        """Analyze and export spike features: each spike as one row with auto-detected window per sweep."""
+        """Analyze spikes and export one row per spike to a single CSV file with save dialog."""
         from scipy.signal import find_peaks, peak_widths
 
         selected_items = self.file_tree.selectedItems()
         if not selected_items:
             QtWidgets.QMessageBox.warning(self, "Warning", "No signals selected for AP analysis.")
             return
-
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder to Save CSV Files", self.last_folder or "")
-        if not folder:
-            return
-        self.last_folder = folder
 
         all_spike_rows = []
         missing_prominence_count = 0
@@ -1607,8 +1601,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             if signal is None:
                 continue
 
-            # Auto spike detection if needed
-            if key not in self.spike_info or self.spike_info[key].get('auto_times') is None or len(self.spike_info[key].get('auto_times')) == 0:
+            if key not in self.spike_info or self.spike_info[key].get('auto_times') is None:
                 self.proc_key = key
                 self.proc_signal = signal
                 self.apply_detect()
@@ -1631,9 +1624,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             t_abs += sweep_offset
 
             info = self.get_spike_info(key=key, create=True)
-            if info is None:
-                continue
-
             spike_times = []
             if info.get('manual_times'):
                 spike_times.extend(info['manual_times'])
@@ -1645,7 +1635,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
             spike_times = np.sort(np.array(spike_times))
 
-            # Estimate rise/decay times using slope-based method
             rise_times, decay_times = [], []
             for spk_time in spike_times[:10]:
                 idx_center = np.argmin(np.abs(t_rel - spk_time))
@@ -1656,24 +1645,18 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                     continue
                 dy = np.gradient(ep_y)
                 peak_idx = np.argmax(ep_y)
-
                 if peak_idx > 1:
-                    rise_region = dy[:peak_idx]
-                    rise_idx = np.argmax(rise_region)
+                    rise_idx = np.argmax(dy[:peak_idx])
                     rise_time = (peak_idx - rise_idx) * dt * 1000
                     rise_times.append(rise_time)
-
                 if peak_idx < len(dy) - 2:
-                    decay_region = dy[peak_idx:]
-                    decay_idx = np.argmin(decay_region)
+                    decay_idx = np.argmin(dy[peak_idx:])
                     decay_time = decay_idx * dt * 1000
                     decay_times.append(decay_time)
 
             window_pre_ms = min(np.median(rise_times) * 1.5, 50) if rise_times else 10
             window_post_ms = min(np.median(decay_times) * 1.5, 50) if decay_times else 20
-
             baseline = extract_baseline_value(signal_y, method='mode') if 'zeroed' in key.lower() else 0.0
-
             sweep_id = key.split('_sweep')[-1] if '_sweep' in key else '0'
 
             for i, spk_time in enumerate(spike_times):
@@ -1682,7 +1665,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 idx_start = max(0, idx_center - int(window_pre_ms / 1000 / dt))
                 idx_end = min(len(signal_y), idx_center + int(window_post_ms / 1000 / dt))
                 ep_y = signal_y[idx_start:idx_end]
-                ep_t = t_rel[idx_start:idx_end] - t_rel[idx_center]
                 if len(ep_y) == 0:
                     continue
 
@@ -1692,86 +1674,77 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                     prominence = np.nan
                     missing_prominence_count += 1
                 else:
-                    peak_vals = ep_y[peaks]
-                    if len(peak_vals) == 0:
-                        peak_idx = np.argmax(ep_y)
+                    best_peak = np.argmax(ep_y[peaks])
+                    peak_idx = peaks[best_peak]
+                    try:
+                        prominence = properties['prominences'][best_peak]
+                    except:
                         prominence = np.nan
                         missing_prominence_count += 1
-                    else:
-                        best_peak = np.argmax(peak_vals)
-                        peak_idx = peaks[best_peak]
-                        try:
-                            prominence = properties['prominences'][best_peak]
-                        except Exception:
-                            prominence = np.nan
-                            missing_prominence_count += 1
 
                 amp = ep_y[peak_idx] + baseline
                 width = peak_widths(ep_y, [peak_idx], rel_height=0.5)[0][0] * dt * 1000
-                
-                try:
-                    raw_width = peak_widths(ep_y, [peak_idx], rel_height=0.5)[0][0]
-                    width = raw_width * dt * 1000 if raw_width > 0 else np.nan  # 或 ''
-                except Exception:
-                    width = np.nan
 
                 half_amp = ep_y[peak_idx] / 2.0
-                left_part = ep_y[:peak_idx]
-                rise_candidates = np.where(left_part <= half_amp)[0]
+                rise_candidates = np.where(ep_y[:peak_idx] <= half_amp)[0]
                 rise_time = (peak_idx - rise_candidates[-1]) * dt * 1000 if len(rise_candidates) > 0 else np.nan
-                right_part = ep_y[peak_idx:]
-                decay_candidates = np.where(right_part <= half_amp)[0]
+                decay_candidates = np.where(ep_y[peak_idx:] <= half_amp)[0]
                 decay_time = decay_candidates[0] * dt * 1000 if len(decay_candidates) > 0 else np.nan
-
                 isi = (spike_times[i] - spike_times[i - 1]) * 1000 if i > 0 else np.nan
 
-            spike_data = {
-                'Sweep': f'sweep{sweep_id}',
-                'Spike Index': i + 1,
-                'Spike Relative Time (ms)': t_rel[idx_center] * 1000,
-                'Spike Absolute Time (ms)': t_abs[idx_center] * 1000,
-                'Width (ms)': width,
-                'Amplitude (mV)': amp,
-                'Prominence (mV)': prominence,
-                'Rise Time (ms)': rise_time,
-                'Decay Time (ms)': decay_time,
-                'ISI (ms)': isi,
-                'Source': key
-            }
-            all_spike_rows.append(spike_data)
-                
-        # check data
+                spike_data = {
+                    'Source': key,
+                    'Sweep': f'sweep{sweep_id}',
+                    'Spike Index': i + 1,
+                    'Spike Relative Time (ms)': t_rel[idx_center] * 1000,
+                    'Spike Absolute Time (ms)': t_abs[idx_center] * 1000,
+                    'Width (ms)': width,
+                    'Amplitude (mV)': amp,
+                    'Prominence (mV)': prominence,
+                    'Rise Time (ms)': rise_time,
+                    'Decay Time (ms)': decay_time,
+                    'ISI (ms)': isi
+                }
+                all_spike_rows.append(spike_data)
+
         if not all_spike_rows:
-            QtWidgets.QMessageBox.information(self, "Export Done. No spikes were detected.")
+            QtWidgets.QMessageBox.information(self, "Export Done", "AP Analysis finished.\nNo spikes were detected.")
             return
+
+        # name=key
+        first_key = selected_items[0].data(0, QtCore.Qt.UserRole)
+        base_name = first_key.split('_sweep')[0]
+        suggested_name = f"{base_name}_apanalysis.csv"
+
+        # path
+        default_dir = os.path.dirname(self.path_map.get(first_key, os.getcwd()))
 
         first_key = selected_items[0].data(0, QtCore.Qt.UserRole)
         base_name = first_key.split('_sweep')[0]
         suggested_name = f"{base_name}_apanalysis.csv"
 
-        # save
+        real_path = self.path_map.get(first_key)
+        default_dir = os.path.dirname(real_path) if real_path and os.path.exists(real_path) else os.getcwd()
+
         file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Save Combined AP Analysis",
-            os.path.join(self.last_folder or "", suggested_name),
+            "Save AP Analysis CSV",
+            os.path.join(default_dir, suggested_name), 
             "CSV Files (*.csv)"
         )
 
         if not file_path:
-            return 
-        
-        self.last_folder = os.path.dirname(file_path)
+            return  # cancel
 
+        self.last_folder = os.path.dirname(file_path)
         df = pd.DataFrame(all_spike_rows)
         df.to_csv(file_path, index=False)
 
-        if total_spike_count == 0:
-            QtWidgets.QMessageBox.information(self, "Export Done", "AP Analysis finished.\nNo spikes were detected.")
-        else:
-            message = f"AP Analysis completed!\n\nTotal spikes analyzed: {total_spike_count}"
-            if missing_prominence_count > 0:
-                message += f"\nSpikes missing prominence: {missing_prominence_count}"
-            QtWidgets.QMessageBox.information(self, "Export Done", message)
+        message = f"AP Analysis completed!\n\nTotal spikes analyzed: {total_spike_count}"
+        if missing_prominence_count > 0:
+            message += f"\nSpikes missing prominence: {missing_prominence_count}"
+        QtWidgets.QMessageBox.information(self, "Export Done", message)
+
 
     #batch
     def batch_preprocess(self):
