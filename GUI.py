@@ -240,7 +240,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.relThresholdSpinBox.setDecimals(0)
         self.relThresholdSpinBox.setSingleStep(1)
         self.relThresholdSpinBox.setValue(0)
-        filter_form.addRow("Threshold (SE):", self.relThresholdSpinBox)
+        filter_form.addRow("Threshold (SD):", self.relThresholdSpinBox)
 
         filter_group.setLayout(filter_form)
         left_layout.addWidget(filter_group)
@@ -1384,13 +1384,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         min_interval = self.minIntervalSpinBox.value() / 1000.0
         min_amp = self.minAmplitudeSpinBox.value()
-        se_factor = self.relThresholdSpinBox.value()
+        std_factor = self.relThresholdSpinBox.value()
 
         filtered_times, filtered_amps = cluster_spikes(
             auto_times, auto_amps,
             min_interval=min_interval,
             min_amplitude=min_amp,
-            se_factor=se_factor
+            std_factor=std_factor
         )
 
         self.update_auto_spikes(filtered_times, filtered_amps)
@@ -1745,7 +1745,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             message += f"\nSpikes missing prominence: {missing_prominence_count}"
         QtWidgets.QMessageBox.information(self, "Export Done", message)
 
-
     #batch
     def batch_preprocess(self):
         """Batch preprocess all sweeps and save as fully standard NIX format."""
@@ -2061,7 +2060,7 @@ def wavelet_spike_detect(signal, fs, freq_range=(80, 250), threshold_std=3, wave
     return spike_idx
 
 #cluster
-def cluster_spikes(spike_times, spike_amps, min_interval=0.03, min_amplitude=0.0, se_factor=0.0):
+def cluster_spikes(spike_times, spike_amps, min_interval=0.03, min_amplitude=0.0, std_factor=0.0):
     spike_times = np.array(spike_times)
     spike_amps = np.array(spike_amps)
 
@@ -2082,14 +2081,11 @@ def cluster_spikes(spike_times, spike_amps, min_interval=0.03, min_amplitude=0.0
         group_times = times_sorted[group_start:group_end]
         group_amps = amps_sorted[group_start:group_end]
 
-        # Step 1: SE filter first
-        if se_factor > 0 and len(group_amps) > 1:
+        # Step 1: SD filter first
+        if std_factor > 0 and len(group_amps) > 1:
             mean_amp = np.mean(group_amps)
-            if len(group_amps) > 1:
-                se = np.std(group_amps) / np.sqrt(len(group_amps))
-                threshold = mean_amp + se_factor * se
-            else:
-                threshold = mean_amp
+            std = np.std(group_amps)
+            threshold = mean_amp + std_factor * std
             keep_mask = group_amps >= threshold
         else:
             keep_mask = np.ones_like(group_amps, dtype=bool)
