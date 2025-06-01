@@ -565,35 +565,53 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             self.show_info("All selected signals saved successfully.", title="Success")
 
     def _save_signal_to_h5(self, out_path, key):
+        import os, re
         from neo import Block, Segment
-        from neo.io import NixIO
-        import re
-
+        from neo.core import AnalogSignal
+        
         if os.path.exists(out_path):
             os.remove(out_path)
 
-        # get sweep
         sweep_match = re.search(r'_sweep(\d+)', key)
         sweep_label = f"sweep{sweep_match.group(1)}" if sweep_match else "sweep0"
 
         blk = Block(name=f"block_{key}")
         seg = Segment(name=sweep_label)
 
-        # Processed signal
-        proc_signal = self.signals.get(key)
-        if proc_signal is not None:
-            proc_signal.name = f"{sweep_label}_processed"
-            seg.analogsignals.append(proc_signal)
+        orig_proc = self.signals.get(key)
+        if orig_proc is not None:
+            data = orig_proc.magnitude.copy().reshape(-1, 1)
+            fs = orig_proc.sampling_rate
+            t0 = orig_proc.t_start
+            unit = orig_proc.units
+            proc_copy = AnalogSignal(
+                data,
+                units=unit,
+                sampling_rate=fs,
+                t_start=t0,
+                name=f"{sweep_label}_processed"
+            )
+            seg.analogsignals.append(proc_copy)
 
-        # Raw signal, backforward finding
         raw_signal = self.raw_signals.get(key)
         if raw_signal is None and key in self.source_map:
             orig_key = self.find_original_raw_key(key)
             raw_signal = self.raw_signals.get(orig_key)
 
         if raw_signal is not None:
-            raw_signal.name = f"{sweep_label}_raw"
-            seg.analogsignals.append(raw_signal)
+            data_raw = raw_signal.magnitude.copy().reshape(-1, 1)
+            fs_raw = raw_signal.sampling_rate
+            t0_raw = raw_signal.t_start
+            unit_raw = raw_signal.units
+
+            raw_copy = AnalogSignal(
+                data_raw,
+                units=unit_raw,
+                sampling_rate=fs_raw,
+                t_start=t0_raw,
+                name=f"{sweep_label}_raw"
+            )
+            seg.analogsignals.append(raw_copy)
 
         blk.segments.append(seg)
 
