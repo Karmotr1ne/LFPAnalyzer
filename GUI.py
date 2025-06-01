@@ -380,11 +380,10 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 # Methods
     #load file
     def load_single_file(self, path):
-        """Load a .abf or .h5 file, including raw, processed signals, and spike events."""
         from copy import deepcopy
         import neo
 
-        base_name = os.path.basename(path)
+        root_name, _ = os.path.splitext(os.path.basename(path))
         ext = os.path.splitext(path)[1].lower()
 
         try:
@@ -410,19 +409,18 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 proc_sig = None
 
                 for sig in seg.analogsignals:
-                    if sig.name == "raw":
+                    if sig.name == "raw" or (isinstance(sig.name, str) and sig.name.endswith("_raw")):
                         raw_sig = deepcopy(sig)
-                    elif sig.name == "processed":
+                    elif sig.name == "processed" or (isinstance(sig.name, str) and sig.name.endswith("_processed")):
                         proc_sig = deepcopy(sig)
 
                 if proc_sig is None and seg.analogsignals:
                     proc_sig = deepcopy(seg.analogsignals[0])
-                    print(f"[Warning] No 'processed' signal found, using the first available signal for {base_name} sweep {i}.")
 
                 if proc_sig is None:
                     continue
 
-                display_name = self._generate_unique_name(f"{base_name}_sweep{i}")
+                display_name = self._generate_unique_name(f"{root_name}_sweep{i}")
 
                 self.signals[display_name] = proc_sig
                 self.path_map[display_name] = path
@@ -431,14 +429,12 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 if raw_sig is not None:
                     self.raw_signals[display_name] = raw_sig
                 else:
-                    self.raw_signals[display_name] = proc_sig  # fallback
+                    self.raw_signals[display_name] = proc_sig
 
-                # Add item to file tree
                 item = QtWidgets.QTreeWidgetItem([display_name])
                 item.setData(0, QtCore.Qt.UserRole, display_name)
                 self.file_tree.addTopLevelItem(item)
 
-                # Set current view if empty
                 if self.current_key is None:
                     self.current_key = display_name
                     self.proc_key = display_name
@@ -498,9 +494,12 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                     break
 
     def find_original_raw_key(self, key):
+        trace = [key]
         while key in self.source_map:
             key = self.source_map[key]
-        return key.split("_")[0]  # move index
+            trace.append(key)
+        print(f"Tracing raw signal source: {' → '.join(trace)}")
+        return key
 
     #save file
     def closeEvent(self, event):
@@ -537,7 +536,6 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                     pass
 
     def save(self):
-        """Save selected signals to separate HDF5 files."""
         selected_items = self.file_tree.selectedItems()
         if not selected_items:
             self.show_warning("No signals selected in the file tree.")
@@ -551,14 +549,13 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         for item in selected_items:
             key = item.data(0, QtCore.Qt.UserRole)
-            signal = self.signals.get(key, None)
-            if signal is None:
-                errors.append(f"{key}: signal not found")
+            if key not in self.signals and key not in self.raw_signals:
+                errors.append(f"{key}: no signal found in memory")
                 continue
 
             out_path = os.path.join(out_dir, f"{key.replace('/', '_')}.h5")
             try:
-                self._save_signal_to_h5(signal, out_path, key)
+                self._save_signal_to_h5(out_path, key)
             except Exception as e:
                 errors.append(f"{key}: {e}")
 
@@ -567,21 +564,39 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         else:
             self.show_info("All selected signals saved successfully.", title="Success")
 
-    def _save_signal_to_h5(self, signal, out_path, key):
+    def _save_signal_to_h5(self, out_path, key):
         from neo import Block, Segment
         from neo.io import NixIO
+        import re
 
         if os.path.exists(out_path):
             os.remove(out_path)
 
-        blk = Block(name=f"block_{key}")
-        seg = Segment(name=f"seg_{key}")
+        # get sweep
+        sweep_match = re.search(r'_sweep(\d+)', key)
+        sweep_label = f"sweep{sweep_match.group(1)}" if sweep_match else "sweep0"
 
-        signal.name = f"sig_{key}"
-        seg.analogsignals.append(signal)
+        blk = Block(name=f"block_{key}")
+        seg = Segment(name=sweep_label)
+
+        # Processed signal
+        proc_signal = self.signals.get(key)
+        if proc_signal is not None:
+            proc_signal.name = f"{sweep_label}_processed"
+            seg.analogsignals.append(proc_signal)
+
+        # Raw signal, backforward finding
+        raw_signal = self.raw_signals.get(key)
+        if raw_signal is None and key in self.source_map:
+            orig_key = self.find_original_raw_key(key)
+            raw_signal = self.raw_signals.get(orig_key)
+
+        if raw_signal is not None:
+            raw_signal.name = f"{sweep_label}_raw"
+            seg.analogsignals.append(raw_signal)
+
         blk.segments.append(seg)
 
-        # signal
         with NixIO(filename=out_path, mode='ow') as io:
             io.write_block(blk)
 
@@ -905,12 +920,10 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
                 continue
 
             original_signal = self.signals[key]
+            orig_fs = original_signal.sampling_rate
             new_magnitude = original_signal.magnitude[::factor]
-
-            # sampling_rate remove factor
-            original_signal.sampling_rate /= factor
-
-            new_key, new_signal = self.create_processed_signal(key, new_magnitude, f"down{factor}x")
+            new_key, new_signal = self.create_processed_signal(key, new_magnitude, f"ds{factor}x")
+            new_signal.sampling_rate = orig_fs / factor
 
             if first_key is None:
                 first_key, first_signal = new_key, new_signal
@@ -938,9 +951,17 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             if key not in self.signals:
                 continue
 
-            signal = self.signals[key]
-            baseline = als_baseline(signal.magnitude.flatten(), lam=lam, p=p)
-            detrended = signal.magnitude.flatten() - baseline
+            original_signal = self.signals[key]
+
+            y = original_signal.magnitude.flatten()  # 1D numpy.ndarray
+
+            try:
+                baseline = als_baseline(y, lam=lam, p=p)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "ALS Error", f"ALS baseline failed for {key}:\n{e}")
+                continue
+
+            detrended = y - baseline
 
             new_key, new_signal = self.create_processed_signal(key, detrended, "als")
 
@@ -970,12 +991,21 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             y = signal.magnitude.flatten()
 
             self.current_key = key
-            sample_values = self.extract_data_from_time_range()
+            sample_values = None
 
-            if sample_values is None or len(sample_values) == 0:
+            if hasattr(self, "time_selector") and self.time_selector is not None and self.chk_use_time.isChecked():
+                sample_values = self.extract_data_from_time_range()  # 返回 numpy.ndarray
+                if sample_values is None or sample_values.size == 0:
+                    sample_values = y
+            else:
                 sample_values = y
 
-            baseline_val = extract_baseline_value(sample_values, method=method)
+            try:
+                baseline_val = extract_baseline_value(sample_values, method=method)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Baseline Error", f"Failed to extract baseline for {key}:\n{e}")
+                continue
+
             centered = y - baseline_val
             centered = np.clip(centered, 0, None)
 
@@ -986,7 +1016,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
 
         if first_key:
             self.finalize_processing(first_key, first_signal, source_key=first_key)
-
+    
     #baseline time selector
     def toggle_time_selector(self, state):
         use_time = state == Qt.Checked
