@@ -772,18 +772,18 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
     def open_context_menu(self, position):
         menu = QtWidgets.QMenu()
 
-        clear_reload_action = menu.addAction("Clear and Reload")
+        clear_reload_action = menu.addAction("Clear")
         overlay_action = menu.addAction("Overlay Selected Signals")
 
         action = menu.exec_(self.file_tree.viewport().mapToGlobal(position))
 
         if action == clear_reload_action:
-            self.clear_and_reload()
+            self.clear()
         elif action == overlay_action:
             self.overlay_selected_signals()
 
     #clear&reload
-    def clear_and_reload(self):
+    def clear(self):
         self.file_tree.clear()
         self.signals.clear()
         self.loaded_paths.clear()
@@ -793,6 +793,7 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
         self.baseline_curve = []
         self.raw_plot.clear()
         self.proc_plot.clear()
+
     def clear_plot_with_selector(self, plot_name, selector_name):
         """clear selected plot and keep utensils"""
         plot = getattr(self, plot_name, None)
@@ -802,8 +803,10 @@ class LFPAnalyzer(QtWidgets.QMainWindow):
             plot.clear()
             if selector is not None and selector not in plot.items():
                 plot.addItem(selector)
+
     def clear_raw_plot(self):
         self.clear_plot_with_selector('raw_plot', 'time_selector')
+        
     def clear_proc_plot(self):
         self.proc_plot.clear()
 
